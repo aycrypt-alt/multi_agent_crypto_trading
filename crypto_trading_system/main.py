@@ -334,16 +334,17 @@ async def run_backtest(symbols: list[str]):
         print("=" * 60)
 
 
-async def run_optimize(symbols: list[str], use_real_data: bool = False, grid_search: bool = False):
+async def run_optimize(symbols: list[str], use_real_data: bool = False,
+                       grid_search: bool = False, leverage: float = 1.0):
     """
     Run backtest + agent performance analysis + weight optimization.
 
     Steps:
     1. Fetch historical data (real or synthetic)
-    2. Run backtest with per-agent signal tracking
+    2. Run backtest with per-agent signal tracking (with leverage)
     3. Analyze each agent's prediction accuracy
     4. Generate optimized confidence weights
-    5. Optionally run parameter grid search
+    5. Optionally run parameter grid search across leverage levels
     6. Save results and optimized weights to disk
     """
     backtest_symbols = symbols[:3]  # Use fewer symbols for faster optimization
@@ -372,7 +373,8 @@ async def run_optimize(symbols: list[str], use_real_data: bool = False, grid_sea
             historical_data[sym] = generate_synthetic_data(sym, num_candles=5000, start_price=start_price)
 
     # ── Step 2: Run backtest with signal tracking ──
-    print("\n  Running backtest with agent signal tracking...")
+    lev_str = f" (leverage: {leverage:.0f}x)" if leverage > 1 else ""
+    print(f"\n  Running backtest with agent signal tracking{lev_str}...")
     message_bus = MessageBus()
     registry = AgentRegistry()
 
@@ -382,7 +384,7 @@ async def run_optimize(symbols: list[str], use_real_data: bool = False, grid_sea
     registry.register(executor, "execution")
 
     orchestrator = Orchestrator(message_bus, registry)
-    engine = BacktestEngine(message_bus, initial_balance=10000.0, orchestrator=orchestrator)
+    engine = BacktestEngine(message_bus, initial_balance=10000.0, orchestrator=orchestrator, leverage=leverage)
 
     await orchestrator.start()
     primary_symbol = backtest_symbols[0]
@@ -400,17 +402,22 @@ async def run_optimize(symbols: list[str], use_real_data: bool = False, grid_sea
     # ── Step 5: Optional parameter grid search ──
     grid_results = []
     if grid_search:
-        print("\n  Running parameter grid search...")
+        print("\n  Running leverage grid search (5x to 100x)...")
         optimizer = ParameterOptimizer(create_strategy_agents, backtest_symbols)
 
+        # Use first 2000 candles for faster grid search iterations
+        grid_data = {}
+        for sym, candles in historical_data.items():
+            grid_data[sym] = candles[:2000]
+
         param_grid = {
-            "signal_threshold": [0.2, 0.3, 0.4, 0.5],
-            "stop_loss_pct": [0.015, 0.02, 0.03],
-            "take_profit_pct": [0.03, 0.04, 0.06],
+            "leverage": [5, 10, 25, 50, 75, 100],
+            "stop_loss_pct": [0.01, 0.02],
+            "take_profit_pct": [0.03, 0.06],
         }
 
         grid_results = await optimizer.grid_search(
-            historical_data,
+            grid_data,
             param_grid,
         )
 
@@ -446,6 +453,8 @@ def main():
                         help="Fetch real historical data from Bybit (optimize mode)")
     parser.add_argument("--grid-search", action="store_true",
                         help="Run parameter grid search (optimize mode)")
+    parser.add_argument("--leverage", type=float, default=1.0,
+                        help="Leverage multiplier for backtest (e.g. 10, 25, 50, 100)")
     args = parser.parse_args()
 
     symbols = args.symbols or TRADING_SYMBOLS
@@ -453,7 +462,8 @@ def main():
     if args.mode == "backtest":
         asyncio.run(run_backtest(symbols))
     elif args.mode == "optimize":
-        asyncio.run(run_optimize(symbols, use_real_data=args.use_real_data, grid_search=args.grid_search))
+        asyncio.run(run_optimize(symbols, use_real_data=args.use_real_data,
+                                 grid_search=args.grid_search, leverage=args.leverage))
     elif args.mode == "paper":
         asyncio.run(run_live(symbols, testnet=True))
     elif args.mode == "live":

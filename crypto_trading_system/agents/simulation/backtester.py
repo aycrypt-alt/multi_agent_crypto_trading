@@ -68,6 +68,9 @@ class BacktestResult:
     avg_trade_pnl: float
     best_trade: float
     worst_trade: float
+    leverage: float = 1.0
+    liquidations: int = 0
+    final_balance: float = 10000.0
     equity_curve: list[float] = field(default_factory=list)
     trades: list[BacktestTrade] = field(default_factory=list)
     agent_signals: list[AgentSignalRecord] = field(default_factory=list)
@@ -79,9 +82,11 @@ class BacktestEngine:
     Enhanced with per-agent signal tracking for performance attribution.
     """
 
-    def __init__(self, message_bus: MessageBus, initial_balance: float = 10000.0, orchestrator=None):
+    def __init__(self, message_bus: MessageBus, initial_balance: float = 10000.0,
+                 orchestrator=None, leverage: float = 1.0):
         self.message_bus = message_bus
         self.orchestrator = orchestrator  # Optional: for flushing signals in backtest
+        self.leverage = leverage  # Leverage multiplier (1x = no leverage, 100x = 100x)
         self.initial_balance = initial_balance
         self.balance = initial_balance
         self.equity_curve: list[float] = [initial_balance]
@@ -89,6 +94,7 @@ class BacktestEngine:
         self._open_positions: dict[str, dict] = {}
         self._daily_returns: list[float] = []
         self._prev_balance = initial_balance
+        self._liquidations = 0
 
         # Per-agent signal tracking
         self._agent_signals: list[AgentSignalRecord] = []
@@ -214,16 +220,45 @@ class BacktestEngine:
         }
 
     def _mark_to_market(self, current_price: float):
-        """Update balance based on current positions."""
+        """Update balance based on current positions, with leverage applied."""
+        liquidated = []
         for sym, pos in self._open_positions.items():
             if pos["current_price"] > 0:
                 prev = pos["current_price"]
                 if pos["direction"] == "long":
-                    pnl = (current_price - prev) / prev * pos["size_usd"]
+                    pnl = (current_price - prev) / prev * pos["size_usd"] * self.leverage
                 else:
-                    pnl = (prev - current_price) / prev * pos["size_usd"]
+                    pnl = (prev - current_price) / prev * pos["size_usd"] * self.leverage
                 self.balance += pnl
+
+                # Liquidation check: if unrealized loss exceeds margin (position value / leverage)
+                entry = pos["entry_price"]
+                if entry > 0:
+                    if pos["direction"] == "long":
+                        total_pnl_pct = (current_price - entry) / entry
+                    else:
+                        total_pnl_pct = (entry - current_price) / entry
+                    # Liquidation threshold: lose 100% of margin (1/leverage of position)
+                    if total_pnl_pct * self.leverage <= -0.95:  # 95% margin loss = liquidation
+                        liquidated.append(sym)
+
             pos["current_price"] = current_price
+
+        # Process liquidations
+        for sym in liquidated:
+            pos = self._open_positions.pop(sym, None)
+            if pos:
+                self._liquidations += 1
+                # Liquidation: lose the full margin (position_size)
+                liq_loss = -pos["size_usd"]
+                self.balance += liq_loss
+                self.trades.append(BacktestTrade(
+                    symbol=sym, direction=pos["direction"],
+                    entry_price=pos["entry_price"], exit_price=current_price,
+                    size_usd=pos["size_usd"], pnl=liq_loss,
+                    entry_time=pos["entry_time"], exit_time=time.time(),
+                    contributing_agents=pos.get("contributing_agents", []),
+                ))
 
     def _close_position(self, symbol: str, exit_price: float, exit_time: float):
         pos = self._open_positions.pop(symbol, None)
@@ -233,9 +268,9 @@ class BacktestEngine:
         if entry <= 0:
             return
         if pos["direction"] == "long":
-            pnl = (exit_price - entry) / entry * pos["size_usd"]
+            pnl = (exit_price - entry) / entry * pos["size_usd"] * self.leverage
         else:
-            pnl = (entry - exit_price) / entry * pos["size_usd"]
+            pnl = (entry - exit_price) / entry * pos["size_usd"] * self.leverage
 
         self.balance += pnl
         self.trades.append(BacktestTrade(
@@ -307,6 +342,9 @@ class BacktestEngine:
             avg_trade_pnl=round(sum(pnls) / len(pnls), 2) if pnls else 0.0,
             best_trade=round(max(pnls), 2) if pnls else 0.0,
             worst_trade=round(min(pnls), 2) if pnls else 0.0,
+            leverage=self.leverage,
+            liquidations=self._liquidations,
+            final_balance=round(self.balance, 2),
             equity_curve=self.equity_curve,
             trades=self.trades,
             agent_signals=self._agent_signals,

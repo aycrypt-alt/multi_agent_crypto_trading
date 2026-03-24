@@ -247,11 +247,16 @@ class ParameterOptimizer:
                     "total_trades": result.total_trades,
                     "win_rate": result.win_rate,
                     "profit_factor": result.profit_factor,
+                    "leverage": result.leverage,
+                    "liquidations": result.liquidations,
+                    "final_balance": result.final_balance,
                 }
                 results.append(result_entry)
-                logger.info(f"    Return: {result.total_return_pct:.2f}% | "
+                lev_str = f"Lev: {result.leverage:.0f}x | " if result.leverage > 1 else ""
+                logger.info(f"    {lev_str}Return: {result.total_return_pct:.2f}% | "
                            f"Sharpe: {result.sharpe_ratio:.2f} | "
-                           f"MaxDD: {result.max_drawdown_pct:.2f}%")
+                           f"MaxDD: {result.max_drawdown_pct:.2f}% | "
+                           f"Liqs: {result.liquidations}")
             except Exception as e:
                 logger.error(f"    Failed: {e}")
                 results.append({"params": params, "error": str(e)})
@@ -338,7 +343,8 @@ class ParameterOptimizer:
 
             orchestrator._aggregation_loop = patched_loop
 
-        engine = BacktestEngine(message_bus, initial_balance=10000.0, orchestrator=orchestrator)
+        leverage = params.get("leverage", 1.0)
+        engine = BacktestEngine(message_bus, initial_balance=10000.0, orchestrator=orchestrator, leverage=leverage)
         await orchestrator.start()
 
         # Run on first available symbol
@@ -398,11 +404,16 @@ def print_performance_report(
     print(f"\n{'─' * 40}")
     print("  PORTFOLIO PERFORMANCE")
     print(f"{'─' * 40}")
+    if result.leverage > 1:
+        print(f"  Leverage:          {result.leverage:>10.0f}x")
     print(f"  Total Return:      {result.total_return_pct:>10.2f}%")
+    print(f"  Final Balance:    ${result.final_balance:>10.2f}")
     print(f"  Sharpe Ratio:      {result.sharpe_ratio:>10.2f}")
     print(f"  Sortino Ratio:     {result.sortino_ratio:>10.2f}")
     print(f"  Max Drawdown:      {result.max_drawdown_pct:>10.2f}%")
     print(f"  Total Trades:      {result.total_trades:>10d}")
+    if result.liquidations > 0:
+        print(f"  Liquidations:      {result.liquidations:>10d}")
     print(f"  Win Rate:          {result.win_rate:>10.1f}%")
     print(f"  Profit Factor:     {result.profit_factor:>10.2f}")
     print(f"  Avg Trade PnL:    ${result.avg_trade_pnl:>10.2f}")
@@ -451,11 +462,17 @@ def print_performance_report(
         print(f"\n{'─' * 80}")
         print(f"  PARAMETER OPTIMIZATION RESULTS (Top 5)")
         print(f"{'─' * 80}")
-        for i, gr in enumerate(grid_results[:5]):
-            print(f"\n  #{i+1}: Sharpe={gr['sharpe_ratio']:.2f} | "
+        for i, gr in enumerate(grid_results[:10]):
+            lev = gr.get('leverage', 1)
+            liqs = gr.get('liquidations', 0)
+            bal = gr.get('final_balance', 0)
+            lev_str = f"Lev={lev:.0f}x | " if lev > 1 else ""
+            liq_str = f" | Liqs={liqs}" if liqs > 0 else ""
+            print(f"\n  #{i+1}: {lev_str}Sharpe={gr['sharpe_ratio']:.2f} | "
                   f"Return={gr['total_return_pct']:.2f}% | "
+                  f"Balance=${bal:.2f} | "
                   f"MaxDD={gr['max_drawdown_pct']:.2f}% | "
-                  f"WinRate={gr['win_rate']:.1f}%")
+                  f"WinRate={gr['win_rate']:.1f}%{liq_str}")
             print(f"       Params: {gr['params']}")
 
         if len(grid_results) > 1:

@@ -105,6 +105,15 @@ class MessageBus:
         self._message_count += 1
         self._stats[message.type.value] = self._stats.get(message.type.value, 0) + 1
 
+    async def drain(self):
+        """Process all pending messages in the queue immediately (for backtest use)."""
+        while not self._queue.empty():
+            try:
+                _, _, message = self._queue.get_nowait()
+                await self._dispatch(message)
+            except Exception:
+                break
+
     async def _process_loop(self):
         while self._running:
             try:

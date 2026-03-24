@@ -144,6 +144,28 @@ class Orchestrator:
 
                 self._pending_signals[symbol] = []
 
+    async def flush_signals(self):
+        """Force-aggregate all pending signals immediately (used in backtest mode)."""
+        for symbol, signals in list(self._pending_signals.items()):
+            if not signals:
+                continue
+            aggregated = self._aggregate_signals(symbol, signals)
+            if aggregated and abs(aggregated.strength) > 0.3:
+                await self.message_bus.publish(Message(
+                    type=MessageType.ORDER_REQUEST,
+                    channel="risk_check",
+                    payload={
+                        "symbol": aggregated.symbol,
+                        "direction": aggregated.direction,
+                        "strength": aggregated.strength,
+                        "confidence": aggregated.confidence,
+                        "contributing_agents": aggregated.contributing_agents,
+                    },
+                    sender_id="orchestrator",
+                    priority=AgentPriority.HIGH.value,
+                ))
+            self._pending_signals[symbol] = []
+
     def _aggregate_signals(self, symbol: str, signals: list[dict]) -> AggregatedSignal | None:
         """
         Weighted voting: each agent's signal is weighted by its confidence.

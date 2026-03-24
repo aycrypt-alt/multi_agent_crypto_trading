@@ -110,13 +110,17 @@ class PositionSizingAgent(Agent):
 
     def _kelly_criterion(self) -> float:
         """Kelly Criterion: f* = (bp - q) / b where b = avg_win/avg_loss."""
+        # Not enough trade history — use conservative fixed fraction
+        if len(self._trade_history) < 5:
+            return self.max_risk_per_trade
         if self._avg_loss == 0:
             return self.max_risk_per_trade
         b = self._avg_win / self._avg_loss
         p = self._win_rate
         q = 1 - p
         kelly = (b * p - q) / b
-        return max(0.0, min(kelly, 0.25))  # Cap at 25%
+        # Floor at a small fraction so we still take trades even with poor stats
+        return max(0.001, min(kelly, 0.25))
 
     def _update_balance(self, message: Message) -> dict | None:
         pnl = message.payload.get("pnl", 0.0)

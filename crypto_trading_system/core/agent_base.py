@@ -114,6 +114,9 @@ class Agent(ABC):
         self.message_bus.subscribe_type(msg_type, self._handle_message)
 
     async def emit(self, msg_type: MessageType, channel: str, payload: dict, priority: int | None = None):
+        # Auto-inject agent name into payload for signal tracking
+        if "agent_name" not in payload:
+            payload["agent_name"] = self.name
         msg = Message(
             type=msg_type,
             channel=channel,

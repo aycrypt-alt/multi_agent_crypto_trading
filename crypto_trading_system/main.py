@@ -6,10 +6,20 @@ This script demonstrates how to:
 2. Spawn hundreds/thousands of agents across multiple symbols
 3. Wire them together through the orchestrator
 4. Run in live mode (Bybit) or backtest mode
+5. Optimize agent weights via backtesting and performance analysis
 
 Usage:
     # Backtest mode (no API keys needed)
     python -m crypto_trading_system.main --mode backtest
+
+    # Optimize mode — backtest + analyze agents + adjust weights
+    python -m crypto_trading_system.main --mode optimize
+
+    # Optimize with real Bybit data (no API keys needed, uses public endpoints)
+    python -m crypto_trading_system.main --mode optimize --use-real-data
+
+    # Optimize with parameter grid search
+    python -m crypto_trading_system.main --mode optimize --grid-search
 
     # Paper trading on Bybit testnet
     python -m crypto_trading_system.main --mode paper
@@ -51,6 +61,13 @@ from .exchange.bybit_client import BybitClient
 
 # Simulation
 from .agents.simulation.backtester import BacktestEngine, MonteCarloSimulator
+from .agents.simulation.data_fetcher import HistoricalDataFetcher, generate_synthetic_data
+from .agents.simulation.optimizer import (
+    AgentPerformanceAnalyzer, ParameterOptimizer,
+    compute_optimized_weights, apply_optimized_weights,
+    print_performance_report, save_optimization_results,
+    load_optimized_weights,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,11 +96,10 @@ BREAKOUT_LOOKBACKS = [10, 14, 20, 30, 55]  # Turtle trading inspired
 ROC_PERIODS = [5, 10, 14, 21]
 
 
-def create_agents(message_bus: MessageBus, registry: AgentRegistry, symbols: list[str]):
+def create_strategy_agents(message_bus: MessageBus, registry: AgentRegistry, symbols: list[str]):
     """
-    Create a full suite of agents for each symbol.
-    With 20 symbols and ~30 agent types per symbol, this creates ~600+ agents.
-    Add more parameter variations to scale to thousands.
+    Create strategy and analysis agents only (no risk/execution).
+    Used by both backtest and optimize modes.
     """
     agent_count = 0
 
@@ -148,6 +164,17 @@ def create_agents(message_bus: MessageBus, registry: AgentRegistry, symbols: lis
     registry.register(agent, "analysis", tags=["correlation"])
     agent_count += 1
 
+    logger.info(f"Created {agent_count} strategy/analysis agents across {len(symbols)} symbols")
+    return agent_count
+
+
+def create_agents(message_bus: MessageBus, registry: AgentRegistry, symbols: list[str]):
+    """
+    Create a full suite of agents for each symbol.
+    With 20 symbols and ~30 agent types per symbol, this creates ~600+ agents.
+    """
+    agent_count = create_strategy_agents(message_bus, registry, symbols)
+
     # ── Risk Management (system-wide) ──
     agent = PositionSizingAgent(message_bus, {"max_risk_per_trade": 0.02, "initial_balance": 10000})
     registry.register(agent, "risk", tags=["position_sizing"])
@@ -183,6 +210,12 @@ async def run_live(symbols: list[str], testnet: bool = True):
     # Create all agents
     create_agents(message_bus, registry, symbols)
 
+    # Load optimized weights if available
+    weights = load_optimized_weights()
+    if weights:
+        apply_optimized_weights(weights, registry)
+        logger.info("Loaded and applied optimized agent weights from previous optimization")
+
     # Add execution agent with exchange client
     executor = OrderExecutorAgent(message_bus, exchange_client=exchange, config={
         "use_limit_orders": True,
@@ -200,6 +233,7 @@ async def run_live(symbols: list[str], testnet: bool = True):
     logger.info(f"  Mode: {'TESTNET' if testnet else 'LIVE'}")
     logger.info(f"  Agents: {registry.count}")
     logger.info(f"  Symbols: {len(symbols)}")
+    logger.info(f"  Optimized weights: {'YES' if weights else 'NO (default)'}")
     logger.info("=" * 60)
 
     # Main data feed loop
@@ -263,29 +297,10 @@ async def run_backtest(symbols: list[str]):
 
     # Generate synthetic price data (replace with real data from Bybit API)
     logger.info("Generating synthetic data for backtest...")
-    num_candles = 5000
-    price = 50000.0  # Starting BTC price
-    historical = []
-    for i in range(num_candles):
-        # Random walk with slight upward drift + occasional volatility spikes
-        drift = 0.0001
-        vol = 0.02 * (1 + 0.5 * math.sin(i / 200))  # Varying volatility
-        change = random.gauss(drift, vol)
-        price *= (1 + change)
-        high = price * (1 + abs(random.gauss(0, 0.005)))
-        low = price * (1 - abs(random.gauss(0, 0.005)))
-        volume = random.uniform(100, 1000) * (1 + abs(change) * 50)
-        historical.append({
-            "timestamp": i,
-            "open": price * (1 + random.gauss(0, 0.001)),
-            "high": high,
-            "low": low,
-            "close": price,
-            "volume": volume,
-        })
+    historical = generate_synthetic_data("BTCUSDT", num_candles=5000)
 
     # Run backtest
-    engine = BacktestEngine(message_bus, initial_balance=10000.0)
+    engine = BacktestEngine(message_bus, initial_balance=10000.0, orchestrator=orchestrator)
     await orchestrator.start()
     result = await engine.run(historical, "BTCUSDT")
     await orchestrator.stop()
@@ -319,18 +334,126 @@ async def run_backtest(symbols: list[str]):
         print("=" * 60)
 
 
+async def run_optimize(symbols: list[str], use_real_data: bool = False, grid_search: bool = False):
+    """
+    Run backtest + agent performance analysis + weight optimization.
+
+    Steps:
+    1. Fetch historical data (real or synthetic)
+    2. Run backtest with per-agent signal tracking
+    3. Analyze each agent's prediction accuracy
+    4. Generate optimized confidence weights
+    5. Optionally run parameter grid search
+    6. Save results and optimized weights to disk
+    """
+    backtest_symbols = symbols[:3]  # Use fewer symbols for faster optimization
+
+    # ── Step 1: Get historical data ──
+    if use_real_data:
+        print("\n  Fetching real historical data from Bybit...")
+        fetcher = HistoricalDataFetcher()
+        try:
+            historical_data = await fetcher.fetch_multi_symbol(
+                backtest_symbols, interval="15", num_candles=5000
+            )
+        finally:
+            await fetcher.close()
+
+        if not any(historical_data.values()):
+            print("  Failed to fetch real data, falling back to synthetic...")
+            use_real_data = False
+
+    if not use_real_data:
+        print("\n  Generating synthetic historical data...")
+        historical_data = {}
+        prices = {"BTCUSDT": 50000, "ETHUSDT": 3000, "SOLUSDT": 100}
+        for sym in backtest_symbols:
+            start_price = prices.get(sym, 100)
+            historical_data[sym] = generate_synthetic_data(sym, num_candles=5000, start_price=start_price)
+
+    # ── Step 2: Run backtest with signal tracking ──
+    print("\n  Running backtest with agent signal tracking...")
+    message_bus = MessageBus()
+    registry = AgentRegistry()
+
+    create_agents(message_bus, registry, backtest_symbols)
+
+    executor = OrderExecutorAgent(message_bus, config={"stop_loss_pct": 0.02, "take_profit_pct": 0.04})
+    registry.register(executor, "execution")
+
+    orchestrator = Orchestrator(message_bus, registry)
+    engine = BacktestEngine(message_bus, initial_balance=10000.0, orchestrator=orchestrator)
+
+    await orchestrator.start()
+    primary_symbol = backtest_symbols[0]
+    result = await engine.run(historical_data[primary_symbol], primary_symbol)
+    await orchestrator.stop()
+
+    # ── Step 3: Analyze agent performance ──
+    print(f"\n  Analyzing {len(result.agent_signals)} agent signals...")
+    analyzer = AgentPerformanceAnalyzer()
+    agent_perfs, strategy_perfs = analyzer.analyze(result.agent_signals)
+
+    # ── Step 4: Compute optimized weights ──
+    weights = compute_optimized_weights(agent_perfs, registry)
+
+    # ── Step 5: Optional parameter grid search ──
+    grid_results = []
+    if grid_search:
+        print("\n  Running parameter grid search...")
+        optimizer = ParameterOptimizer(create_strategy_agents, backtest_symbols)
+
+        param_grid = {
+            "signal_threshold": [0.2, 0.3, 0.4, 0.5],
+            "stop_loss_pct": [0.015, 0.02, 0.03],
+            "take_profit_pct": [0.03, 0.04, 0.06],
+        }
+
+        grid_results = await optimizer.grid_search(
+            historical_data,
+            param_grid,
+        )
+
+    # ── Step 6: Print report and save results ──
+    print_performance_report(result, agent_perfs, strategy_perfs, grid_results)
+
+    filepath = save_optimization_results(
+        result, agent_perfs, strategy_perfs, weights, grid_results
+    )
+
+    # Monte Carlo
+    if result.trades:
+        print("\n  Running Monte Carlo simulation (1000 iterations)...")
+        mc = MonteCarloSimulator(result.trades, initial_balance=10000.0)
+        mc_result = mc.run(1000)
+        print(f"  MC Mean Return:       {mc_result['return_mean']:>8.2f}%")
+        print(f"  MC 5th Percentile:    {mc_result['return_5th_pct']:>8.2f}%")
+        print(f"  MC 95th Percentile:   {mc_result['return_95th_pct']:>8.2f}%")
+        print(f"  MC Prob Profitable:   {mc_result['probability_profitable']:>8.1f}%")
+
+    print(f"\n  Results saved to: {filepath}")
+    print(f"  Optimized weights saved — will be auto-loaded in paper/live mode.")
+    print("=" * 80)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-Agent Crypto Trading System")
-    parser.add_argument("--mode", choices=["live", "paper", "backtest"], default="backtest",
+    parser.add_argument("--mode", choices=["live", "paper", "backtest", "optimize"], default="backtest",
                         help="Trading mode")
     parser.add_argument("--symbols", nargs="+", default=None,
                         help="Trading symbols (default: top 20)")
+    parser.add_argument("--use-real-data", action="store_true",
+                        help="Fetch real historical data from Bybit (optimize mode)")
+    parser.add_argument("--grid-search", action="store_true",
+                        help="Run parameter grid search (optimize mode)")
     args = parser.parse_args()
 
     symbols = args.symbols or TRADING_SYMBOLS
 
     if args.mode == "backtest":
         asyncio.run(run_backtest(symbols))
+    elif args.mode == "optimize":
+        asyncio.run(run_optimize(symbols, use_real_data=args.use_real_data, grid_search=args.grid_search))
     elif args.mode == "paper":
         asyncio.run(run_live(symbols, testnet=True))
     elif args.mode == "live":

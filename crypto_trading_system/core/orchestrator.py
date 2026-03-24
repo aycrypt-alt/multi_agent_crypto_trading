@@ -66,6 +66,11 @@ class Orchestrator:
     - Monitor agent health and performance
     """
 
+    # Strategies that perform well in trending markets
+    TREND_STRATEGIES = {"ma_crossover", "macd", "breakout", "roc_momentum", "mtf_momentum"}
+    # Strategies that perform well in ranging/mean-reverting markets
+    REVERSION_STRATEGIES = {"bollinger_reversion", "rsi_reversion", "zscore_reversion"}
+
     def __init__(self, message_bus: MessageBus, registry: AgentRegistry):
         self.message_bus = message_bus
         self.registry = registry
@@ -74,6 +79,9 @@ class Orchestrator:
         self._pending_signals: dict[str, list[dict]] = defaultdict(list)
         self._signal_window_ms = 2000  # Aggregate signals within 2s windows
         self._last_aggregation: float = 0.0
+        # Price tracking for regime detection
+        self._price_history: dict[str, list[float]] = defaultdict(list)
+        self._regime_by_symbol: dict[str, str] = {}
 
     async def start(self):
         """Start the orchestrator and all registered agents."""
@@ -84,6 +92,7 @@ class Orchestrator:
         self.message_bus.subscribe_type(MessageType.STRATEGY_SIGNAL, self._on_strategy_signal)
         self.message_bus.subscribe_type(MessageType.RISK_ALERT, self._on_risk_alert)
         self.message_bus.subscribe_type(MessageType.ANOMALY_DETECTED, self._on_anomaly)
+        self.message_bus.subscribe_type(MessageType.MARKET_DATA, self._on_market_data)
 
         # Start all agents
         agents = list(self.registry._agents.values())
@@ -103,6 +112,82 @@ class Orchestrator:
         logger.info("Orchestrator stopped")
 
     # ── Signal Aggregation ─────────────────────────────────────
+
+    async def _on_market_data(self, message: Message):
+        """Track prices for regime detection."""
+        symbol = message.payload.get("symbol", "")
+        close = message.payload.get("close", 0.0)
+        if symbol and close > 0:
+            self._price_history[symbol].append(close)
+            # Keep last 100 prices
+            if len(self._price_history[symbol]) > 100:
+                self._price_history[symbol] = self._price_history[symbol][-100:]
+            self._detect_regime(symbol)
+
+    def _detect_regime(self, symbol: str):
+        """Simple regime detection: trending vs ranging based on price action."""
+        prices = self._price_history[symbol]
+        if len(prices) < 50:
+            self._regime_by_symbol[symbol] = "unknown"
+            return
+
+        # Use slope of 20-period SMA over last 30 bars to detect trend
+        sma_window = 20
+        sma_values = []
+        for i in range(len(prices) - 30, len(prices)):
+            if i >= sma_window:
+                sma_values.append(sum(prices[i - sma_window:i]) / sma_window)
+
+        if len(sma_values) < 10:
+            self._regime_by_symbol[symbol] = "unknown"
+            return
+
+        # Trend strength: linear regression slope of SMA normalized by price
+        n = len(sma_values)
+        x_mean = (n - 1) / 2
+        y_mean = sum(sma_values) / n
+        numerator = sum((i - x_mean) * (sma_values[i] - y_mean) for i in range(n))
+        denominator = sum((i - x_mean) ** 2 for i in range(n))
+        slope = numerator / denominator if denominator > 0 else 0
+        normalized_slope = slope / y_mean * 100 if y_mean > 0 else 0
+
+        if abs(normalized_slope) > 0.05:
+            self._regime_by_symbol[symbol] = "trending"
+        else:
+            self._regime_by_symbol[symbol] = "ranging"
+
+    def _filter_by_regime(self, symbol: str, signals: list[dict]) -> list[dict]:
+        """Filter signals based on market regime — suppress conflicting strategies."""
+        regime = self._regime_by_symbol.get(symbol, "unknown")
+        if regime == "unknown":
+            return signals  # No filtering if regime unclear
+
+        filtered = []
+        for sig in signals:
+            agent = self.registry.get(sig["sender"])
+            if not agent:
+                filtered.append(sig)
+                continue
+
+            # Determine strategy type from agent name
+            agent_name = agent.name.lower()
+            is_trend = any(s in agent_name for s in
+                           ("ma_crossover", "macd", "breakout", "roc_momentum", "mtf_momentum"))
+            is_reversion = any(s in agent_name for s in
+                               ("bollinger", "rsi_reversion", "zscore"))
+
+            # In trending markets: suppress mean-reversion, boost trend signals
+            if regime == "trending" and is_reversion:
+                # Reduce confidence by 70% instead of fully suppressing
+                sig = sig.copy()
+                sig["confidence"] *= 0.3
+            # In ranging markets: suppress trend-following, boost reversion
+            elif regime == "ranging" and is_trend:
+                sig = sig.copy()
+                sig["confidence"] *= 0.3
+
+            filtered.append(sig)
+        return filtered
 
     async def _on_strategy_signal(self, message: Message):
         """Collect strategy signals for aggregation."""
@@ -125,6 +210,8 @@ class Orchestrator:
                 if not signals:
                     continue
 
+                # Apply regime filter before aggregation
+                signals = self._filter_by_regime(symbol, signals)
                 aggregated = self._aggregate_signals(symbol, signals)
                 if aggregated and abs(aggregated.strength) > 0.3:
                     # Send to risk management before execution
@@ -149,6 +236,8 @@ class Orchestrator:
         for symbol, signals in list(self._pending_signals.items()):
             if not signals:
                 continue
+            # Apply regime filter before aggregation
+            signals = self._filter_by_regime(symbol, signals)
             aggregated = self._aggregate_signals(symbol, signals)
             if aggregated and abs(aggregated.strength) > 0.3:
                 await self.message_bus.publish(Message(

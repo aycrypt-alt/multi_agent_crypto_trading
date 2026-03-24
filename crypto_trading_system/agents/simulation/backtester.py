@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 from ...core.agent_base import Agent, AgentPriority
 from ...core.message_bus import Message, MessageBus, MessageType
-from ...utils.indicators import max_drawdown, sharpe_ratio, sortino_ratio
+from ...utils.indicators import atr as compute_atr, max_drawdown, sharpe_ratio, sortino_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +82,13 @@ class BacktestEngine:
     Enhanced with per-agent signal tracking for performance attribution.
     """
 
+    # Transaction cost per side (Bybit maker fee)
+    FEE_RATE = 0.00075  # 0.075%
+    # ATR-based stop-loss/take-profit multipliers
+    ATR_SL_MULT = 2.0  # Stop-loss at 2x ATR
+    ATR_TP_MULT = 3.0  # Take-profit at 3x ATR (1.5:1 reward/risk)
+    ATR_PERIOD = 14
+
     def __init__(self, message_bus: MessageBus, initial_balance: float = 10000.0,
                  orchestrator=None, leverage: float = 1.0):
         self.message_bus = message_bus
@@ -95,6 +102,12 @@ class BacktestEngine:
         self._daily_returns: list[float] = []
         self._prev_balance = initial_balance
         self._liquidations = 0
+        self._total_fees = 0.0
+
+        # OHLC history for ATR computation
+        self._highs: list[float] = []
+        self._lows: list[float] = []
+        self._closes: list[float] = []
 
         # Per-agent signal tracking
         self._agent_signals: list[AgentSignalRecord] = []
@@ -122,6 +135,9 @@ class BacktestEngine:
         for i, candle in enumerate(historical_data):
             self._candle_index = i
             self._price_history.append(candle["close"])
+            self._highs.append(candle["high"])
+            self._lows.append(candle["low"])
+            self._closes.append(candle["close"])
 
             # Publish market data
             await self.message_bus.publish(Message(
@@ -193,8 +209,16 @@ class BacktestEngine:
         )
         self._agent_signals.append(record)
 
+    def _current_atr(self) -> float:
+        """Compute current ATR from OHLC history."""
+        if len(self._highs) < self.ATR_PERIOD + 1:
+            # Fallback: use 1% of last price
+            return self._price_history[-1] * 0.01 if self._price_history else 0.0
+        atr_values = compute_atr(self._highs, self._lows, self._closes, self.ATR_PERIOD)
+        return atr_values[-1] if atr_values else self._price_history[-1] * 0.01
+
     async def _on_order(self, message: Message):
-        """Simulate order execution."""
+        """Simulate order execution with transaction fees and ATR-based SL/TP."""
         symbol = message.payload.get("symbol", "")
         direction = message.payload.get("direction", "")
         size_usd = message.payload.get("size_usd", 0.0)
@@ -210,19 +234,58 @@ class BacktestEngine:
             if existing["direction"] != direction:
                 self._close_position(symbol, existing.get("current_price", existing["entry_price"]), time.time())
 
+        entry_price = message.payload.get("entry_price", 0.0) or (self._price_history[-1] if self._price_history else size_usd)
+
+        # Deduct entry fee
+        entry_fee = size_usd * self.FEE_RATE
+        self.balance -= entry_fee
+        self._total_fees += entry_fee
+
+        # Compute ATR-based stop-loss and take-profit levels
+        current_atr = self._current_atr()
+        if direction == "long":
+            stop_loss = entry_price - current_atr * self.ATR_SL_MULT
+            take_profit = entry_price + current_atr * self.ATR_TP_MULT
+        else:
+            stop_loss = entry_price + current_atr * self.ATR_SL_MULT
+            take_profit = entry_price - current_atr * self.ATR_TP_MULT
+
         self._open_positions[symbol] = {
             "direction": direction,
-            "entry_price": message.payload.get("entry_price", 0.0) or (self._price_history[-1] if self._price_history else size_usd),
+            "entry_price": entry_price,
             "size_usd": size_usd,
             "current_price": 0.0,
             "entry_time": time.time(),
             "contributing_agents": contributing,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
         }
 
     def _mark_to_market(self, current_price: float):
-        """Update balance based on current positions, with leverage applied."""
+        """Update balance based on current positions, with leverage, ATR SL/TP, and fees."""
         liquidated = []
+        sl_tp_closed = []
+
         for sym, pos in self._open_positions.items():
+            # Check ATR-based stop-loss and take-profit
+            sl = pos.get("stop_loss", 0)
+            tp = pos.get("take_profit", 0)
+            if sl > 0 and tp > 0:
+                if pos["direction"] == "long":
+                    if current_price <= sl:
+                        sl_tp_closed.append((sym, sl, "stop_loss"))
+                        continue
+                    elif current_price >= tp:
+                        sl_tp_closed.append((sym, tp, "take_profit"))
+                        continue
+                else:  # short
+                    if current_price >= sl:
+                        sl_tp_closed.append((sym, sl, "stop_loss"))
+                        continue
+                    elif current_price <= tp:
+                        sl_tp_closed.append((sym, tp, "take_profit"))
+                        continue
+
             if pos["current_price"] > 0:
                 prev = pos["current_price"]
                 if pos["direction"] == "long":
@@ -243,6 +306,10 @@ class BacktestEngine:
                         liquidated.append(sym)
 
             pos["current_price"] = current_price
+
+        # Process ATR-based SL/TP exits
+        for sym, exit_price, reason in sl_tp_closed:
+            self._close_position(sym, exit_price, time.time())
 
         # Process liquidations
         for sym in liquidated:
@@ -271,6 +338,11 @@ class BacktestEngine:
             pnl = (exit_price - entry) / entry * pos["size_usd"] * self.leverage
         else:
             pnl = (entry - exit_price) / entry * pos["size_usd"] * self.leverage
+
+        # Deduct exit fee
+        exit_fee = pos["size_usd"] * self.FEE_RATE
+        pnl -= exit_fee
+        self._total_fees += exit_fee
 
         self.balance += pnl
         self.trades.append(BacktestTrade(

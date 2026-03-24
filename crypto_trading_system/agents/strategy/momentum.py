@@ -17,6 +17,8 @@ from ...utils.indicators import ema, rsi
 class ROCMomentumAgent(Agent):
     """Rate of Change momentum — enters when ROC accelerates."""
 
+    SIGNAL_COOLDOWN = 5  # Minimum candles between signals
+
     def __init__(self, message_bus: MessageBus, symbol: str, period: int = 12, threshold: float = 2.0):
         super().__init__(
             name=f"roc_momentum_{symbol}_{period}",
@@ -27,6 +29,8 @@ class ROCMomentumAgent(Agent):
         self.period = period
         self.threshold = threshold
         self._prices: list[float] = []
+        self._candle_count = 0
+        self._last_signal_candle = -self.SIGNAL_COOLDOWN  # Allow first signal immediately
 
     async def on_start(self):
         await self.subscribe(f"market_data.{self.symbol}")
@@ -36,7 +40,12 @@ class ROCMomentumAgent(Agent):
             return None
 
         self._prices.append(message.payload.get("close", 0.0))
+        self._candle_count += 1
         if len(self._prices) < self.period + 1:
+            return None
+
+        # Cooldown: skip if too soon since last signal
+        if self._candle_count - self._last_signal_candle < self.SIGNAL_COOLDOWN:
             return None
 
         roc = ((self._prices[-1] - self._prices[-self.period - 1])
@@ -48,6 +57,7 @@ class ROCMomentumAgent(Agent):
         signal = "long" if roc > 0 else "short"
         strength = min(abs(roc) / (self.threshold * 3), 1.0)
 
+        self._last_signal_candle = self._candle_count
         self.metrics.signals_generated += 1
         await self.emit(
             MessageType.STRATEGY_SIGNAL,
@@ -67,6 +77,8 @@ class ROCMomentumAgent(Agent):
 class VolumeWeightedMomentumAgent(Agent):
     """Momentum weighted by volume — stronger volume = stronger conviction."""
 
+    SIGNAL_COOLDOWN = 5  # Minimum candles between signals
+
     def __init__(self, message_bus: MessageBus, symbol: str, period: int = 14):
         super().__init__(
             name=f"vol_momentum_{symbol}",
@@ -77,6 +89,8 @@ class VolumeWeightedMomentumAgent(Agent):
         self.period = period
         self._prices: list[float] = []
         self._volumes: list[float] = []
+        self._candle_count = 0
+        self._last_signal_candle = -self.SIGNAL_COOLDOWN
 
     async def on_start(self):
         await self.subscribe(f"market_data.{self.symbol}")
@@ -87,8 +101,13 @@ class VolumeWeightedMomentumAgent(Agent):
 
         self._prices.append(message.payload.get("close", 0.0))
         self._volumes.append(message.payload.get("volume", 0.0))
+        self._candle_count += 1
 
         if len(self._prices) < self.period + 1:
+            return None
+
+        # Cooldown: skip if too soon since last signal
+        if self._candle_count - self._last_signal_candle < self.SIGNAL_COOLDOWN:
             return None
 
         # Volume-weighted price momentum
@@ -114,6 +133,7 @@ class VolumeWeightedMomentumAgent(Agent):
         signal = "long" if normalized > 0 else "short"
         strength = min(abs(normalized) * vol_ratio / 10, 1.0)
 
+        self._last_signal_candle = self._candle_count
         self.metrics.signals_generated += 1
         await self.emit(
             MessageType.STRATEGY_SIGNAL,
@@ -136,6 +156,8 @@ class MultiTimeframeMomentumAgent(Agent):
     Signal only fires when short, medium, and long-term momentum align.
     """
 
+    SIGNAL_COOLDOWN = 5  # Minimum candles between signals
+
     def __init__(self, message_bus: MessageBus, symbol: str):
         super().__init__(
             name=f"mtf_momentum_{symbol}",
@@ -145,6 +167,8 @@ class MultiTimeframeMomentumAgent(Agent):
         self.symbol = symbol
         self._prices: list[float] = []
         self.timeframes = [5, 15, 50]  # Short, medium, long lookbacks
+        self._candle_count = 0
+        self._last_signal_candle = -self.SIGNAL_COOLDOWN
 
     async def on_start(self):
         await self.subscribe(f"market_data.{self.symbol}")
@@ -154,7 +178,12 @@ class MultiTimeframeMomentumAgent(Agent):
             return None
 
         self._prices.append(message.payload.get("close", 0.0))
+        self._candle_count += 1
         if len(self._prices) < max(self.timeframes) + 1:
+            return None
+
+        # Cooldown: skip if too soon since last signal
+        if self._candle_count - self._last_signal_candle < self.SIGNAL_COOLDOWN:
             return None
 
         # Calculate momentum for each timeframe
@@ -176,6 +205,7 @@ class MultiTimeframeMomentumAgent(Agent):
         strength = math.exp(sum(math.log(max(m, 1e-10)) for m in abs_momentums) / len(abs_momentums))
         strength = min(strength * 100, 1.0)
 
+        self._last_signal_candle = self._candle_count
         self.metrics.signals_generated += 1
         await self.emit(
             MessageType.STRATEGY_SIGNAL,

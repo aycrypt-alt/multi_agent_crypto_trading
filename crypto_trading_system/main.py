@@ -88,12 +88,11 @@ TRADING_SYMBOLS = [
 # ── MA parameter combinations for scaling agents ─────────────
 
 MA_PARAMS = [
-    (5, 13), (7, 21), (9, 21), (10, 30), (12, 26),
-    (15, 50), (20, 50), (20, 100), (50, 100), (50, 200),
+    (9, 21), (12, 26), (50, 200),  # Pruned from 10 to top 3 uncorrelated pairs
 ]
 
-BREAKOUT_LOOKBACKS = [10, 14, 20, 30, 55]  # Turtle trading inspired
-ROC_PERIODS = [5, 10, 14, 21]
+BREAKOUT_LOOKBACKS = [20, 55]  # Pruned from 5 to 2 (classic Donchian + long-range)
+ROC_PERIODS = [10, 21]  # Pruned from 4 to 2 (short + medium lookback)
 
 
 def create_strategy_agents(message_bus: MessageBus, registry: AgentRegistry, symbols: list[str]):

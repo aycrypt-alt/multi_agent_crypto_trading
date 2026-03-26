@@ -8,8 +8,9 @@ routes final decisions to execution agents.
 
 import asyncio
 import logging
+import math
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 from .agent_base import Agent, AgentPriority, AgentState
@@ -81,7 +82,23 @@ class Orchestrator:
         self._last_aggregation: float = 0.0
         # Price tracking for regime detection
         self._price_history: dict[str, list[float]] = defaultdict(list)
+        self._volume_history: dict[str, list[float]] = defaultdict(list)
         self._regime_by_symbol: dict[str, str] = {}
+        self._volatility_by_symbol: dict[str, str] = {}  # "high", "normal", "low"
+
+        # Meta-learner: track per-agent, per-regime signal outcomes
+        self._agent_regime_scores: dict[str, dict[str, deque]] = defaultdict(
+            lambda: defaultdict(lambda: deque(maxlen=50))
+        )
+        # Track recent aggregated decisions and their outcomes
+        self._decision_history: deque[dict] = deque(maxlen=100)
+        self._decision_eval_horizon = 15  # candles to evaluate a decision
+
+        # Entry confirmation buffer: signals wait here for price confirmation
+        # {symbol: {"signal": AggregatedSignal, "entry_price": float, "candle_idx": int, "wait_candles": 0}}
+        self._pending_confirmations: dict[str, dict] = {}
+        self.CONFIRMATION_WAIT = 2      # Wait up to 2 candles for confirmation
+        self.CONFIRMATION_MOVE = 0.001  # Price must move 0.1% in signal direction
 
     async def start(self):
         """Start the orchestrator and all registered agents."""
@@ -114,53 +131,153 @@ class Orchestrator:
     # ── Signal Aggregation ─────────────────────────────────────
 
     async def _on_market_data(self, message: Message):
-        """Track prices for regime detection."""
+        """Track prices for regime detection and decision evaluation."""
         symbol = message.payload.get("symbol", "")
         close = message.payload.get("close", 0.0)
+        volume = message.payload.get("volume", 0.0)
         if symbol and close > 0:
             self._price_history[symbol].append(close)
-            # Keep last 100 prices
-            if len(self._price_history[symbol]) > 100:
-                self._price_history[symbol] = self._price_history[symbol][-100:]
+            self._volume_history[symbol].append(volume)
+            # Keep last 200 prices for better regime detection
+            if len(self._price_history[symbol]) > 200:
+                self._price_history[symbol] = self._price_history[symbol][-200:]
+                self._volume_history[symbol] = self._volume_history[symbol][-200:]
             self._detect_regime(symbol)
+            self._evaluate_past_decisions(symbol, close)
 
     def _detect_regime(self, symbol: str):
-        """Simple regime detection: trending vs ranging based on price action."""
+        """Enhanced multi-factor regime detection: trend, volatility, and momentum alignment."""
         prices = self._price_history[symbol]
-        if len(prices) < 50:
+        if len(prices) < 60:
             self._regime_by_symbol[symbol] = "unknown"
+            self._volatility_by_symbol[symbol] = "normal"
             return
 
-        # Use slope of 20-period SMA over last 30 bars to detect trend
-        sma_window = 20
-        sma_values = []
-        for i in range(len(prices) - 30, len(prices)):
-            if i >= sma_window:
-                sma_values.append(sum(prices[i - sma_window:i]) / sma_window)
+        # 1. Trend detection via dual SMA slope
+        sma_short = sum(prices[-20:]) / 20
+        sma_long = sum(prices[-50:]) / 50
+        sma_ratio = (sma_short - sma_long) / sma_long if sma_long > 0 else 0
 
-        if len(sma_values) < 10:
-            self._regime_by_symbol[symbol] = "unknown"
-            return
-
-        # Trend strength: linear regression slope of SMA normalized by price
-        n = len(sma_values)
+        # Linear regression slope of last 30 prices
+        recent = prices[-30:]
+        n = len(recent)
         x_mean = (n - 1) / 2
-        y_mean = sum(sma_values) / n
-        numerator = sum((i - x_mean) * (sma_values[i] - y_mean) for i in range(n))
+        y_mean = sum(recent) / n
+        numerator = sum((i - x_mean) * (recent[i] - y_mean) for i in range(n))
         denominator = sum((i - x_mean) ** 2 for i in range(n))
         slope = numerator / denominator if denominator > 0 else 0
         normalized_slope = slope / y_mean * 100 if y_mean > 0 else 0
 
-        if abs(normalized_slope) > 0.05:
-            self._regime_by_symbol[symbol] = "trending"
+        # 2. Volatility classification
+        returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(-20, 0)]
+        vol = math.sqrt(sum(r**2 for r in returns) / len(returns)) if returns else 0
+        vol_annualized = vol * math.sqrt(365 * 96)  # 15-min candles
+
+        if vol_annualized > 1.0:
+            self._volatility_by_symbol[symbol] = "high"
+        elif vol_annualized < 0.3:
+            self._volatility_by_symbol[symbol] = "low"
         else:
+            self._volatility_by_symbol[symbol] = "normal"
+
+        # 3. Regime classification — combine trend slope + SMA alignment
+        if abs(normalized_slope) > 0.05 and abs(sma_ratio) > 0.002:
+            self._regime_by_symbol[symbol] = "trending"
+        elif abs(normalized_slope) < 0.02 and abs(sma_ratio) < 0.001:
             self._regime_by_symbol[symbol] = "ranging"
+        else:
+            self._regime_by_symbol[symbol] = "transitioning"
+
+    def _evaluate_past_decisions(self, symbol: str, current_price: float):
+        """Evaluate past aggregated decisions to learn which agent combos work."""
+        for decision in self._decision_history:
+            if decision.get("evaluated") or decision["symbol"] != symbol:
+                continue
+            if decision["candle_idx"] + self._decision_eval_horizon > len(self._price_history[symbol]):
+                continue
+
+            entry_price = decision["price"]
+            price_change = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+
+            correct = (
+                (decision["direction"] == "long" and price_change > 0) or
+                (decision["direction"] == "short" and price_change < 0)
+            )
+            decision["evaluated"] = True
+            decision["correct"] = correct
+
+            # Update per-agent regime scores
+            regime = decision.get("regime", "unknown")
+            for agent_name in decision.get("agents", []):
+                self._agent_regime_scores[agent_name][regime].append(1.0 if correct else 0.0)
+
+    def _get_agent_regime_weight(self, agent_name: str, regime: str) -> float:
+        """Get learned weight for an agent in the current regime.
+        Returns a multiplier: >1 if agent is good in this regime, <1 if bad."""
+        scores = self._agent_regime_scores.get(agent_name, {}).get(regime, deque())
+        if len(scores) < 5:
+            # Not enough data — fall back to strategy-type heuristic
+            return self._heuristic_regime_weight(agent_name, regime)
+
+        # Exponentially weighted accuracy
+        alpha = 0.1
+        weighted = 0.0
+        total_w = 0.0
+        for i, score in enumerate(scores):
+            w = math.exp(alpha * (i - len(scores)))
+            weighted += w * score
+            total_w += w
+        accuracy = weighted / total_w if total_w > 0 else 0.5
+
+        # Map accuracy to weight: 50% = 1.0, 60% = 1.3, 40% = 0.7
+        return 0.4 + accuracy * 1.2
+
+    def _heuristic_regime_weight(self, agent_name: str, regime: str) -> float:
+        """Fallback heuristic before we have enough learning data."""
+        name = agent_name.lower()
+        is_trend = any(s in name for s in
+                       ("ma_crossover", "macd", "breakout", "roc_momentum", "mtf_momentum"))
+        is_reversion = any(s in name for s in
+                           ("bollinger", "rsi_reversion", "zscore"))
+
+        if regime == "trending":
+            if is_reversion:
+                return 0.3
+            if is_trend:
+                return 1.2
+        elif regime == "ranging":
+            if is_trend:
+                return 0.3
+            if is_reversion:
+                return 1.2
+        elif regime == "transitioning":
+            # In transitions, slightly favor trend-following
+            if is_trend:
+                return 1.0
+            if is_reversion:
+                return 0.6
+        return 1.0
+
+    def _regime_gate_blocks(self, symbol: str) -> bool:
+        """Hard regime gate: block ALL trading in unfavorable conditions.
+        Returns True if trading should be BLOCKED."""
+        regime = self._regime_by_symbol.get(symbol, "unknown")
+        volatility = self._volatility_by_symbol.get(symbol, "normal")
+
+        # Block in unknown regime (not enough data)
+        if regime == "unknown":
+            return True
+
+        # Block in choppy/low-vol ranging markets — signals are noise
+        if regime == "ranging" and volatility == "low":
+            return True
+
+        return False
 
     def _filter_by_regime(self, symbol: str, signals: list[dict]) -> list[dict]:
-        """Filter signals based on market regime — suppress conflicting strategies."""
+        """ML meta-learner: weight signals by learned agent-regime performance."""
         regime = self._regime_by_symbol.get(symbol, "unknown")
-        if regime == "unknown":
-            return signals  # No filtering if regime unclear
+        volatility = self._volatility_by_symbol.get(symbol, "normal")
 
         filtered = []
         for sig in signals:
@@ -169,22 +286,21 @@ class Orchestrator:
                 filtered.append(sig)
                 continue
 
-            # Determine strategy type from agent name
-            agent_name = agent.name.lower()
-            is_trend = any(s in agent_name for s in
-                           ("ma_crossover", "macd", "breakout", "roc_momentum", "mtf_momentum"))
-            is_reversion = any(s in agent_name for s in
-                               ("bollinger", "rsi_reversion", "zscore"))
+            sig = sig.copy()
 
-            # In trending markets: suppress mean-reversion, boost trend signals
-            if regime == "trending" and is_reversion:
-                # Reduce confidence by 70% instead of fully suppressing
-                sig = sig.copy()
-                sig["confidence"] *= 0.3
-            # In ranging markets: suppress trend-following, boost reversion
-            elif regime == "ranging" and is_trend:
-                sig = sig.copy()
-                sig["confidence"] *= 0.3
+            # Apply learned regime weight
+            regime_weight = self._get_agent_regime_weight(agent.name, regime)
+            sig["confidence"] *= regime_weight
+
+            # Volatility adjustment — reduce confidence in high-vol, signals are noisier
+            if volatility == "high":
+                sig["confidence"] *= 0.7
+                sig["strength"] *= 0.8
+            elif volatility == "low":
+                sig["confidence"] *= 1.1  # Low vol = cleaner signals
+
+            # Use agent's adaptive self-learned confidence
+            sig["confidence"] *= agent.confidence
 
             filtered.append(sig)
         return filtered
@@ -204,61 +320,107 @@ class Orchestrator:
         """Periodically aggregate pending signals into consensus decisions."""
         while self._running:
             await asyncio.sleep(self._signal_window_ms / 1000)
-            now = time.time()
 
             for symbol, signals in list(self._pending_signals.items()):
                 if not signals:
                     continue
-
-                # Apply regime filter before aggregation
-                signals = self._filter_by_regime(symbol, signals)
-                aggregated = self._aggregate_signals(symbol, signals)
-                if aggregated and abs(aggregated.strength) > 0.3:
-                    # Send to risk management before execution
-                    await self.message_bus.publish(Message(
-                        type=MessageType.ORDER_REQUEST,
-                        channel="risk_check",
-                        payload={
-                            "symbol": aggregated.symbol,
-                            "direction": aggregated.direction,
-                            "strength": aggregated.strength,
-                            "confidence": aggregated.confidence,
-                            "contributing_agents": aggregated.contributing_agents,
-                        },
-                        sender_id="orchestrator",
-                        priority=AgentPriority.HIGH.value,
-                    ))
-
+                await self._process_signals(symbol, signals)
                 self._pending_signals[symbol] = []
+
+            # Check pending confirmations
+            await self._check_pending_confirmations()
 
     async def flush_signals(self):
         """Force-aggregate all pending signals immediately (used in backtest mode)."""
         for symbol, signals in list(self._pending_signals.items()):
             if not signals:
                 continue
-            # Apply regime filter before aggregation
-            signals = self._filter_by_regime(symbol, signals)
-            aggregated = self._aggregate_signals(symbol, signals)
-            if aggregated and abs(aggregated.strength) > 0.3:
-                await self.message_bus.publish(Message(
-                    type=MessageType.ORDER_REQUEST,
-                    channel="risk_check",
-                    payload={
-                        "symbol": aggregated.symbol,
-                        "direction": aggregated.direction,
-                        "strength": aggregated.strength,
-                        "confidence": aggregated.confidence,
-                        "contributing_agents": aggregated.contributing_agents,
-                    },
-                    sender_id="orchestrator",
-                    priority=AgentPriority.HIGH.value,
-                ))
+            await self._process_signals(symbol, signals)
             self._pending_signals[symbol] = []
+
+        # Check pending confirmations each candle
+        await self._check_pending_confirmations()
+
+    async def _process_signals(self, symbol: str, signals: list[dict]):
+        """Apply regime gate, aggregate, and buffer for entry confirmation."""
+        # ── HARD REGIME GATE: block in unfavorable conditions ──
+        if self._regime_gate_blocks(symbol):
+            return
+
+        signals = self._filter_by_regime(symbol, signals)
+        aggregated = self._aggregate_signals(symbol, signals)
+
+        if not aggregated or abs(aggregated.strength) <= 0.50 or len(aggregated.contributing_agents) < 2:
+            return
+
+        # ── ENTRY CONFIRMATION: buffer signal, wait for price to confirm ──
+        prices = self._price_history.get(symbol, [])
+        if prices:
+            self._pending_confirmations[symbol] = {
+                "signal": aggregated,
+                "entry_price": prices[-1],
+                "candle_idx": len(prices),
+                "wait_candles": 0,
+            }
+        else:
+            # No price history, send immediately
+            await self._send_order(aggregated)
+
+    async def _check_pending_confirmations(self):
+        """Check buffered signals for price confirmation before entering."""
+        expired = []
+        for symbol, pending in list(self._pending_confirmations.items()):
+            prices = self._price_history.get(symbol, [])
+            if not prices:
+                continue
+
+            signal = pending["signal"]
+            entry_price = pending["entry_price"]
+            current_price = prices[-1]
+            pending["wait_candles"] += 1
+
+            # Check if price has confirmed the signal direction
+            price_move = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+
+            confirmed = False
+            if signal.direction == "long" and price_move > self.CONFIRMATION_MOVE:
+                confirmed = True
+            elif signal.direction == "short" and price_move < -self.CONFIRMATION_MOVE:
+                confirmed = True
+
+            if confirmed:
+                await self._send_order(signal)
+                expired.append(symbol)
+            elif pending["wait_candles"] >= self.CONFIRMATION_WAIT:
+                # Signal expired without confirmation — discard
+                expired.append(symbol)
+
+        for sym in expired:
+            self._pending_confirmations.pop(sym, None)
+
+    async def _send_order(self, aggregated: AggregatedSignal):
+        """Send confirmed signal to risk management for execution."""
+        await self.message_bus.publish(Message(
+            type=MessageType.ORDER_REQUEST,
+            channel="risk_check",
+            payload={
+                "symbol": aggregated.symbol,
+                "direction": aggregated.direction,
+                "strength": aggregated.strength,
+                "confidence": aggregated.confidence,
+                "contributing_agents": aggregated.contributing_agents,
+            },
+            sender_id="orchestrator",
+            priority=AgentPriority.HIGH.value,
+        ))
 
     def _aggregate_signals(self, symbol: str, signals: list[dict]) -> AggregatedSignal | None:
         """
-        Weighted voting: each agent's signal is weighted by its confidence.
-        This allows high-performing agents to have more influence.
+        ML Meta-Learner Aggregation:
+        1. Weight each signal by agent's regime-specific learned performance
+        2. Calculate directional agreement ratio (what % of agents agree)
+        3. Boost confidence when high-performing agents agree
+        4. Record decision for future learning
         """
         if not signals:
             return None
@@ -266,16 +428,24 @@ class Orchestrator:
         weighted_sum = 0.0
         total_weight = 0.0
         contributors = []
+        long_count = 0
+        short_count = 0
 
         for sig in signals:
             agent = self.registry.get(sig["sender"])
-            agent_confidence = agent.confidence if agent else 0.5
 
-            # Weight = agent's historical confidence * signal confidence
-            weight = agent_confidence * sig["confidence"]
+            # Weight already includes regime weight, volatility adjustment, and
+            # agent self-learned confidence from _filter_by_regime
+            weight = sig["confidence"] * sig["strength"]
             direction_value = 1.0 if sig["direction"] == "long" else (-1.0 if sig["direction"] == "short" else 0.0)
-            weighted_sum += direction_value * sig["strength"] * weight
-            total_weight += weight
+
+            if sig["direction"] == "long":
+                long_count += 1
+            elif sig["direction"] == "short":
+                short_count += 1
+
+            weighted_sum += direction_value * weight
+            total_weight += abs(weight)
 
             if agent:
                 contributors.append(agent.name)
@@ -286,11 +456,39 @@ class Orchestrator:
         net_strength = weighted_sum / total_weight
         direction = "long" if net_strength > 0 else ("short" if net_strength < 0 else "neutral")
 
+        # Directional agreement bonus — strong consensus = higher confidence
+        total_directional = long_count + short_count
+        if total_directional > 0:
+            majority = max(long_count, short_count)
+            agreement_ratio = majority / total_directional
+            # Scale: 50% agreement = 0.7x, 75% = 1.0x, 100% = 1.3x
+            agreement_multiplier = 0.4 + agreement_ratio * 0.9
+        else:
+            agreement_multiplier = 0.7
+
+        final_confidence = min(total_weight / len(signals) * agreement_multiplier, 1.5)
+        final_strength = abs(net_strength) * agreement_multiplier
+
+        # Record this decision for future meta-learning evaluation
+        prices = self._price_history.get(symbol, [])
+        if prices:
+            self._decision_history.append({
+                "symbol": symbol,
+                "direction": direction,
+                "strength": final_strength,
+                "price": prices[-1],
+                "candle_idx": len(prices),
+                "regime": self._regime_by_symbol.get(symbol, "unknown"),
+                "agents": contributors,
+                "agreement_ratio": agreement_ratio if total_directional > 0 else 0,
+                "evaluated": False,
+            })
+
         return AggregatedSignal(
             symbol=symbol,
             direction=direction,
-            strength=abs(net_strength),
-            confidence=min(total_weight / len(signals), 1.0),
+            strength=final_strength,
+            confidence=final_confidence,
             contributing_agents=contributors,
         )
 

@@ -109,6 +109,75 @@ def atr(highs: list[float], lows: list[float], closes: list[float], period: int 
     return sma(true_ranges, period)
 
 
+def adx(highs: list[float], lows: list[float], closes: list[float], period: int = 14) -> list[float]:
+    """Average Directional Index — measures trend strength (0-100).
+    Values above 25 indicate a strong trend, below 20 indicate ranging."""
+    if len(highs) < period + 1:
+        return []
+
+    plus_dm_list = []
+    minus_dm_list = []
+    tr_list = []
+
+    for i in range(1, len(highs)):
+        up_move = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
+
+        plus_dm = up_move if up_move > down_move and up_move > 0 else 0.0
+        minus_dm = down_move if down_move > up_move and down_move > 0 else 0.0
+        plus_dm_list.append(plus_dm)
+        minus_dm_list.append(minus_dm)
+
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        tr_list.append(tr)
+
+    if len(tr_list) < period:
+        return []
+
+    # Smoothed using Wilder's method
+    smoothed_tr = sum(tr_list[:period])
+    smoothed_plus = sum(plus_dm_list[:period])
+    smoothed_minus = sum(minus_dm_list[:period])
+
+    dx_list = []
+
+    for i in range(period, len(tr_list)):
+        smoothed_tr = smoothed_tr - smoothed_tr / period + tr_list[i]
+        smoothed_plus = smoothed_plus - smoothed_plus / period + plus_dm_list[i]
+        smoothed_minus = smoothed_minus - smoothed_minus / period + minus_dm_list[i]
+
+        plus_di = 100 * smoothed_plus / smoothed_tr if smoothed_tr > 0 else 0
+        minus_di = 100 * smoothed_minus / smoothed_tr if smoothed_tr > 0 else 0
+        di_sum = plus_di + minus_di
+        dx = 100 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0
+        dx_list.append(dx)
+
+    if len(dx_list) < period:
+        return []
+
+    # Smooth DX to get ADX
+    adx_val = sum(dx_list[:period]) / period
+    result = [adx_val]
+    for i in range(period, len(dx_list)):
+        adx_val = (adx_val * (period - 1) + dx_list[i]) / period
+        result.append(adx_val)
+
+    return result
+
+
+def volume_ratio(volumes: list[float], period: int = 20) -> float:
+    """Current volume relative to the average over `period` bars.
+    >1.5 = volume spike, <0.5 = low volume."""
+    if len(volumes) < period + 1:
+        return 1.0
+    avg = sum(volumes[-period - 1:-1]) / period
+    return volumes[-1] / avg if avg > 0 else 1.0
+
+
 def vwap(prices: list[float], volumes: list[float]) -> list[float]:
     """Volume Weighted Average Price."""
     if not prices or not volumes or len(prices) != len(volumes):

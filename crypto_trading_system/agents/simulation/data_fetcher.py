@@ -37,7 +37,8 @@ class HistoricalDataFetcher:
     async def _ensure_session(self):
         if self._session is None:
             import aiohttp
-            self._session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=30, connect=15, sock_connect=15, sock_read=15)
+            self._session = aiohttp.ClientSession(timeout=timeout)
 
     async def close(self):
         if self._session:
@@ -70,6 +71,8 @@ class HistoricalDataFetcher:
         remaining = num_candles
         end_time = int(time.time() * 1000)  # Start from now, go backwards
         interval_ms = self.INTERVAL_MS.get(interval, 900_000)
+        max_retries = 5
+        consecutive_errors = 0
 
         logger.info(f"Fetching {num_candles} candles for {symbol} ({interval}m)...")
 
@@ -112,15 +115,20 @@ class HistoricalDataFetcher:
                 end_time = oldest_ts - 1
 
                 remaining -= len(candles_raw)
+                consecutive_errors = 0
                 logger.info(f"  Fetched {len(all_candles)}/{num_candles} candles...")
 
                 # Rate limiting — be polite to the API
                 await asyncio.sleep(0.15)
 
             except Exception as e:
+                consecutive_errors += 1
                 logger.error(f"Fetch error for {symbol}: {e}")
+                if consecutive_errors >= max_retries:
+                    logger.error(f"Max retries ({max_retries}) reached for {symbol}, stopping fetch")
+                    break
                 # Retry with backoff
-                await asyncio.sleep(2)
+                await asyncio.sleep(2 * consecutive_errors)
                 continue
 
         # Sort oldest-first

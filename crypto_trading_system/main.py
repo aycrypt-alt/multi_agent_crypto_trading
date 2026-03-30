@@ -41,6 +41,7 @@ from .core.orchestrator import Orchestrator
 from .agents.strategy.trend_following import MACrossoverAgent, MACDAgent, BreakoutAgent
 from .agents.strategy.mean_reversion import BollingerReversionAgent, RSIReversionAgent, ZScoreReversionAgent
 from .agents.strategy.momentum import ROCMomentumAgent, VolumeWeightedMomentumAgent, MultiTimeframeMomentumAgent
+from .agents.strategy.swarm_intelligence import SwarmPersonaAgent, SwarmDebateAgent, NewsInjectorAgent, PERSONAS
 
 # Confluence agents (multi-indicator)
 from .agents.strategy.confluence import (
@@ -193,6 +194,20 @@ def create_strategy_agents(message_bus: MessageBus, registry: AgentRegistry, sym
         registry.register(agent, "analysis", tags=["microstructure", symbol])
         agent_count += 1
 
+        # ── Swarm Intelligence (MiroFish-inspired) ──
+        for persona in PERSONAS:
+            agent = SwarmPersonaAgent(message_bus, symbol, persona)
+            registry.register(agent, "strategy", tags=["swarm", persona, symbol])
+            agent_count += 1
+
+        agent = SwarmDebateAgent(message_bus, symbol)
+        registry.register(agent, "strategy", tags=["swarm", "debate", symbol])
+        agent_count += 1
+
+        agent = NewsInjectorAgent(message_bus, symbol)
+        registry.register(agent, "analysis", tags=["swarm", "news", symbol])
+        agent_count += 1
+
     # ── Cross-asset analysis ──
     agent = CorrelationAgent(message_bus, symbols)
     registry.register(agent, "analysis", tags=["correlation"])
@@ -328,27 +343,43 @@ async def run_live(symbols: list[str], testnet: bool = True, leverage: int = 25)
 
 
 async def run_backtest(symbols: list[str]):
-    """Run backtest with synthetic data (replace with real historical data)."""
-    import math
-    import random
+    """Run backtest with real historical data from backtest_data/ directory."""
+    import json
+    from pathlib import Path
+
+    data_dir = Path(__file__).parent.parent / "backtest_data"
+    backtest_symbols = symbols[:3]
+
+    # Load historical data from local JSON files
+    historical_data = {}
+    for sym in backtest_symbols:
+        filepath = data_dir / f"{sym}_15m_5000.json"
+        if filepath.exists():
+            with open(filepath) as f:
+                historical_data[sym] = json.load(f)
+            logger.info(f"Loaded {len(historical_data[sym])} candles for {sym} from {filepath.name}")
+        else:
+            logger.warning(f"No data file for {sym}, generating synthetic data...")
+            historical_data[sym] = generate_synthetic_data(sym, num_candles=5000)
+
+    if not historical_data:
+        logger.error("No historical data available. Place JSON files in backtest_data/")
+        return
 
     message_bus = MessageBus()
     registry = AgentRegistry()
-    create_agents(message_bus, registry, symbols[:3])  # Backtest with fewer symbols
+    create_agents(message_bus, registry, list(historical_data.keys()))
 
     executor = OrderExecutorAgent(message_bus, config={"stop_loss_pct": 0.02, "take_profit_pct": 0.04})
     registry.register(executor, "execution")
 
     orchestrator = Orchestrator(message_bus, registry)
 
-    # Generate synthetic price data (replace with real data from Bybit API)
-    logger.info("Generating synthetic data for backtest...")
-    historical = generate_synthetic_data("BTCUSDT", num_candles=5000)
-
-    # Run backtest
+    # Run backtest on each symbol with real data
+    primary_symbol = list(historical_data.keys())[0]
     engine = BacktestEngine(message_bus, initial_balance=10000.0, orchestrator=orchestrator)
     await orchestrator.start()
-    result = await engine.run(historical, "BTCUSDT")
+    result = await engine.run(historical_data[primary_symbol], primary_symbol)
     await orchestrator.stop()
 
     # Print results

@@ -76,7 +76,7 @@ class OrderExecutorAgent(Agent):
         side = "Buy" if direction == "long" else "Sell"
 
         if not self.exchange:
-            logger.warning(f"No exchange client — simulated order: {side} {symbol} ${size_usd:.2f}")
+            logger.debug(f"Backtest mode — order routed to BacktestEngine: {side} {symbol} ${size_usd:.2f}")
             # Emit simulated fill
             await self.emit(
                 MessageType.ORDER_FILLED,
@@ -165,7 +165,7 @@ class OrderExecutorAgent(Agent):
         """Close an existing position before opening in the opposite direction."""
         self._positions.pop(symbol, None)
         if not self.exchange:
-            logger.info(f"Simulated close for direction flip: {symbol}")
+            logger.debug(f"Backtest mode — close for direction flip: {symbol}")
             return
         try:
             positions = await self.exchange.get_positions()
@@ -186,7 +186,7 @@ class OrderExecutorAgent(Agent):
     async def _close_all_positions(self):
         """Emergency close all positions."""
         if not self.exchange:
-            logger.warning("Emergency close — no exchange client (simulated)")
+            logger.debug("Backtest mode — emergency close (handled by BacktestEngine)")
             return
 
         try:

@@ -71,6 +71,9 @@ class Orchestrator:
     TREND_STRATEGIES = {"ma_crossover", "macd", "breakout", "roc_momentum", "mtf_momentum"}
     # Strategies that perform well in ranging/mean-reverting markets
     REVERSION_STRATEGIES = {"bollinger_reversion", "rsi_reversion", "zscore_reversion"}
+    # Swarm strategies are regime-agnostic (they have their own internal logic)
+    SWARM_STRATEGIES = {"swarm_whale", "swarm_retail", "swarm_institutional", "swarm_quant",
+                        "swarm_contrarian", "swarm_consensus"}
 
     def __init__(self, message_bus: MessageBus, registry: AgentRegistry):
         self.message_bus = message_bus
@@ -287,6 +290,13 @@ class Orchestrator:
                 continue
 
             sig = sig.copy()
+
+            # Determine strategy type from agent name
+            agent_name = agent.name.lower()
+            is_swarm = "swarm_" in agent_name
+            if is_swarm:
+                filtered.append(sig)
+                continue  # Swarm agents handle regime internally
 
             # Apply learned regime weight
             regime_weight = self._get_agent_regime_weight(agent.name, regime)

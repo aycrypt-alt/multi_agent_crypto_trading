@@ -6,3 +6,4 @@ dist/
 build/
 optimization_results/
 backtest_data/
+.claude/

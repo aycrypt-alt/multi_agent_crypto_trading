@@ -69,10 +69,14 @@ class OrderExecutorAgent(Agent):
         if size_usd < 1.0:
             return {"status": "skipped", "reason": "size_too_small"}
 
+        # Close existing position if direction flipped
+        if symbol in self._positions and self._positions[symbol].get("direction") != direction:
+            await self._close_position_for_symbol(symbol)
+
         side = "Buy" if direction == "long" else "Sell"
 
         if not self.exchange:
-            logger.warning(f"No exchange client — simulated order: {side} {symbol} ${size_usd:.2f}")
+            logger.debug(f"Backtest mode — order routed to BacktestEngine: {side} {symbol} ${size_usd:.2f}")
             # Emit simulated fill
             await self.emit(
                 MessageType.ORDER_FILLED,
@@ -81,11 +85,13 @@ class OrderExecutorAgent(Agent):
                     "symbol": symbol,
                     "side": side,
                     "size_usd": size_usd,
+                    "direction": direction,
                     "fill_price": order.get("entry_price", 0.0),
                     "pnl": 0.0,
                     "simulated": True,
                 },
             )
+            self._positions[symbol] = {"direction": direction, "size_usd": size_usd}
             return {"status": "simulated", "symbol": symbol, "size_usd": size_usd}
 
         try:
@@ -128,16 +134,10 @@ class OrderExecutorAgent(Agent):
                     "price": current_price,
                     "time": time.time(),
                 }
+                self._positions[symbol] = {"direction": direction, "size_usd": size_usd}
 
-                # Set stop-loss
-                sl_pct = self.config.get("stop_loss_pct", 0.02)
-                sl_price = current_price * (1 - sl_pct) if side == "Buy" else current_price * (1 + sl_pct)
-                await self.exchange.set_stop_loss(symbol, sl_price)
-
-                # Set take-profit
-                tp_pct = self.config.get("take_profit_pct", 0.04)
-                tp_price = current_price * (1 + tp_pct) if side == "Buy" else current_price * (1 - tp_pct)
-                await self.exchange.set_take_profit(symbol, tp_price)
+                # NOTE: SL/TP is now managed by PositionManagerAgent using ATR-based
+                # trailing stops, breakeven stops, and time exits. No fixed-% SL/TP here.
 
                 logger.info(f"Order placed: {side} {symbol} qty={qty:.4f} @ {current_price:.2f}")
                 await self.emit(
@@ -146,7 +146,9 @@ class OrderExecutorAgent(Agent):
                     {
                         "symbol": symbol,
                         "side": side,
+                        "direction": direction,
                         "qty": qty,
+                        "size_usd": size_usd,
                         "fill_price": current_price,
                         "order_id": result["order_id"],
                     },
@@ -159,10 +161,32 @@ class OrderExecutorAgent(Agent):
             logger.error(f"Order execution error: {e}", exc_info=True)
             return {"status": "error", "reason": str(e)}
 
+    async def _close_position_for_symbol(self, symbol: str):
+        """Close an existing position before opening in the opposite direction."""
+        self._positions.pop(symbol, None)
+        if not self.exchange:
+            logger.debug(f"Backtest mode — close for direction flip: {symbol}")
+            return
+        try:
+            positions = await self.exchange.get_positions()
+            for pos in positions:
+                if pos["symbol"] == symbol and float(pos.get("size", 0)) > 0:
+                    close_side = "Sell" if pos.get("side") == "Buy" else "Buy"
+                    await self.exchange.place_order(
+                        symbol=symbol,
+                        side=close_side,
+                        order_type="Market",
+                        qty=float(pos["size"]),
+                        reduce_only=True,
+                    )
+                    logger.info(f"Closed {symbol} for direction flip")
+        except Exception as e:
+            logger.error(f"Failed to close {symbol} for flip: {e}")
+
     async def _close_all_positions(self):
         """Emergency close all positions."""
         if not self.exchange:
-            logger.warning("Emergency close — no exchange client (simulated)")
+            logger.debug("Backtest mode — emergency close (handled by BacktestEngine)")
             return
 
         try:

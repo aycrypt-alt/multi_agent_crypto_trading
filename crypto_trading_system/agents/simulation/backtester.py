@@ -85,9 +85,15 @@ class BacktestEngine:
     # Transaction cost per side (Bybit maker fee)
     FEE_RATE = 0.00075  # 0.075%
     # ATR-based stop-loss/take-profit multipliers
-    ATR_SL_MULT = 2.0  # Stop-loss at 2x ATR
-    ATR_TP_MULT = 3.0  # Take-profit at 3x ATR (1.5:1 reward/risk)
+    # Tighter TP than SL → higher win rate; trailing stop lets winners run
+    ATR_SL_MULT = 1.8   # Stop-loss at 1.8x ATR
+    ATR_TP_MULT = 1.5   # Take-profit at 1.5x ATR (close to 1:1 for high win rate)
     ATR_PERIOD = 14
+    # Trailing stop: once trade is in profit by 0.3x ATR, trail at 0.6x ATR behind peak
+    TRAIL_ACTIVATION_ATR = 0.3  # Activate trailing stop early to lock in small profits
+    TRAIL_DISTANCE_ATR = 0.6    # Tight trail: 0.6x ATR behind best price
+    # Time-based exit: if trade doesn't profit within N candles, exit at market
+    MAX_HOLD_CANDLES = 12       # Exit stale trades faster — reduces losers
 
     def __init__(self, message_bus: MessageBus, initial_balance: float = 10000.0,
                  orchestrator=None, leverage: float = 1.0):
@@ -259,56 +265,106 @@ class BacktestEngine:
             "contributing_agents": contributing,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
+            "entry_candle": self._candle_index,
+            "best_price": entry_price,  # Track best price for trailing stop
+            "atr_at_entry": current_atr,
+            "trailing_active": False,
         }
 
     def _mark_to_market(self, current_price: float):
-        """Update balance based on current positions, with leverage, ATR SL/TP, and fees."""
+        """Update balance with trailing stops, time exits, ATR SL/TP, and leverage."""
         liquidated = []
-        sl_tp_closed = []
+        exits = []  # (sym, exit_price, reason)
 
         for sym, pos in self._open_positions.items():
-            # Check ATR-based stop-loss and take-profit
+            entry = pos["entry_price"]
+            atr_at_entry = pos.get("atr_at_entry", entry * 0.01)
+            is_long = pos["direction"] == "long"
+
+            # ── 1. Update best price for trailing stop ──
+            best = pos.get("best_price", entry)
+            if is_long:
+                best = max(best, current_price)
+            else:
+                best = min(best, current_price)
+            pos["best_price"] = best
+
+            # ── 2. Check trailing stop activation & trigger ──
+            profit_in_atr = ((current_price - entry) / atr_at_entry) if is_long else ((entry - current_price) / atr_at_entry)
+
+            if profit_in_atr >= self.TRAIL_ACTIVATION_ATR:
+                pos["trailing_active"] = True
+                # Move stop-loss to breakeven + fees once trailing activates
+                fee_buffer = entry * self.FEE_RATE * 2.5  # Cover entry+exit fees
+                if is_long:
+                    breakeven_stop = entry + fee_buffer
+                    if pos["stop_loss"] < breakeven_stop:
+                        pos["stop_loss"] = breakeven_stop
+                else:
+                    breakeven_stop = entry - fee_buffer
+                    if pos["stop_loss"] > breakeven_stop:
+                        pos["stop_loss"] = breakeven_stop
+
+            if pos.get("trailing_active"):
+                trail_dist = atr_at_entry * self.TRAIL_DISTANCE_ATR
+                if is_long:
+                    trailing_stop = best - trail_dist
+                    if current_price <= trailing_stop:
+                        exits.append((sym, current_price, "trailing_stop"))
+                        continue
+                else:
+                    trailing_stop = best + trail_dist
+                    if current_price >= trailing_stop:
+                        exits.append((sym, current_price, "trailing_stop"))
+                        continue
+
+            # ── 3. Check ATR-based hard stop-loss and take-profit ──
             sl = pos.get("stop_loss", 0)
             tp = pos.get("take_profit", 0)
             if sl > 0 and tp > 0:
-                if pos["direction"] == "long":
+                if is_long:
                     if current_price <= sl:
-                        sl_tp_closed.append((sym, sl, "stop_loss"))
+                        exits.append((sym, sl, "stop_loss"))
                         continue
                     elif current_price >= tp:
-                        sl_tp_closed.append((sym, tp, "take_profit"))
+                        exits.append((sym, tp, "take_profit"))
                         continue
-                else:  # short
+                else:
                     if current_price >= sl:
-                        sl_tp_closed.append((sym, sl, "stop_loss"))
+                        exits.append((sym, sl, "stop_loss"))
                         continue
                     elif current_price <= tp:
-                        sl_tp_closed.append((sym, tp, "take_profit"))
+                        exits.append((sym, tp, "take_profit"))
                         continue
 
+            # ── 4. Time-based exit: close stale trades ──
+            candles_held = self._candle_index - pos.get("entry_candle", 0)
+            if candles_held >= self.MAX_HOLD_CANDLES:
+                exits.append((sym, current_price, "time_exit"))
+                continue
+
+            # ── 5. Standard mark-to-market PnL ──
             if pos["current_price"] > 0:
                 prev = pos["current_price"]
-                if pos["direction"] == "long":
+                if is_long:
                     pnl = (current_price - prev) / prev * pos["size_usd"] * self.leverage
                 else:
                     pnl = (prev - current_price) / prev * pos["size_usd"] * self.leverage
                 self.balance += pnl
 
-                # Liquidation check: if unrealized loss exceeds margin (position value / leverage)
-                entry = pos["entry_price"]
+                # Liquidation check
                 if entry > 0:
-                    if pos["direction"] == "long":
+                    if is_long:
                         total_pnl_pct = (current_price - entry) / entry
                     else:
                         total_pnl_pct = (entry - current_price) / entry
-                    # Liquidation threshold: lose 100% of margin (1/leverage of position)
-                    if total_pnl_pct * self.leverage <= -0.95:  # 95% margin loss = liquidation
+                    if total_pnl_pct * self.leverage <= -0.95:
                         liquidated.append(sym)
 
             pos["current_price"] = current_price
 
-        # Process ATR-based SL/TP exits
-        for sym, exit_price, reason in sl_tp_closed:
+        # Process exits (trailing, SL/TP, time)
+        for sym, exit_price, reason in exits:
             self._close_position(sym, exit_price, time.time())
 
         # Process liquidations
@@ -316,7 +372,6 @@ class BacktestEngine:
             pos = self._open_positions.pop(sym, None)
             if pos:
                 self._liquidations += 1
-                # Liquidation: lose the full margin (position_size)
                 liq_loss = -pos["size_usd"]
                 self.balance += liq_loss
                 self.trades.append(BacktestTrade(
@@ -334,21 +389,33 @@ class BacktestEngine:
         entry = pos["entry_price"]
         if entry <= 0:
             return
+
+        # Use last marked price as base to avoid double-counting M2M PnL.
+        # Balance already reflects incremental PnL up to the last marked price.
+        base_price = pos["current_price"] if pos["current_price"] > 0 else entry
         if pos["direction"] == "long":
-            pnl = (exit_price - entry) / entry * pos["size_usd"] * self.leverage
+            close_pnl = (exit_price - base_price) / base_price * pos["size_usd"] * self.leverage
         else:
-            pnl = (entry - exit_price) / entry * pos["size_usd"] * self.leverage
+            close_pnl = (base_price - exit_price) / base_price * pos["size_usd"] * self.leverage
 
         # Deduct exit fee
         exit_fee = pos["size_usd"] * self.FEE_RATE
-        pnl -= exit_fee
+        close_pnl -= exit_fee
         self._total_fees += exit_fee
 
-        self.balance += pnl
+        self.balance += close_pnl
+
+        # Record full entry→exit PnL for trade stats (includes both entry + exit fees)
+        if pos["direction"] == "long":
+            full_pnl = (exit_price - entry) / entry * pos["size_usd"] * self.leverage
+        else:
+            full_pnl = (entry - exit_price) / entry * pos["size_usd"] * self.leverage
+        full_pnl -= pos["size_usd"] * self.FEE_RATE * 2  # entry + exit fees
+
         self.trades.append(BacktestTrade(
             symbol=symbol, direction=pos["direction"],
             entry_price=entry, exit_price=exit_price,
-            size_usd=pos["size_usd"], pnl=pnl,
+            size_usd=pos["size_usd"], pnl=full_pnl,
             entry_time=pos["entry_time"], exit_time=exit_time,
             contributing_agents=pos.get("contributing_agents", []),
         ))

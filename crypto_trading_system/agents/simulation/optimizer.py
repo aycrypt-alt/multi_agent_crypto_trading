@@ -401,9 +401,9 @@ def print_performance_report(
     print("=" * 80)
 
     # Overall results
-    print(f"\n{'─' * 40}")
+    print(f"\n{'-' * 40}")
     print("  PORTFOLIO PERFORMANCE")
-    print(f"{'─' * 40}")
+    print(f"{'-' * 40}")
     if result.leverage > 1:
         print(f"  Leverage:          {result.leverage:>10.0f}x")
     print(f"  Total Return:      {result.total_return_pct:>10.2f}%")
@@ -422,11 +422,11 @@ def print_performance_report(
 
     # Strategy performance
     if strategy_perfs:
-        print(f"\n{'─' * 80}")
+        print(f"\n{'-' * 80}")
         print("  STRATEGY PERFORMANCE RANKING")
-        print(f"{'─' * 80}")
+        print(f"{'-' * 80}")
         print(f"  {'Strategy':<25} {'Agents':>7} {'Signals':>8} {'Acc@10':>7} {'Acc@30':>7} {'Acc@60':>7} {'Weight':>7}")
-        print(f"  {'─'*25} {'─'*7} {'─'*8} {'─'*7} {'─'*7} {'─'*7} {'─'*7}")
+        print(f"  {'-'*25} {'-'*7} {'-'*8} {'-'*7} {'-'*7} {'-'*7} {'-'*7}")
         for sp in strategy_perfs:
             print(f"  {sp.strategy:<25} {sp.agent_count:>7d} {sp.total_signals:>8d} "
                   f"{sp.avg_accuracy_10:>6.1f}% {sp.avg_accuracy_30:>6.1f}% "
@@ -435,11 +435,11 @@ def print_performance_report(
     # Top 20 agents
     if agent_perfs:
         active_agents = [p for p in agent_perfs if p.total_signals > 0]
-        print(f"\n{'─' * 80}")
+        print(f"\n{'-' * 80}")
         print(f"  TOP {min(20, len(active_agents))} AGENTS BY COMPOSITE SCORE")
-        print(f"{'─' * 80}")
+        print(f"{'-' * 80}")
         print(f"  {'Agent Name':<40} {'Sigs':>5} {'Acc@30':>7} {'Score':>7} {'New Wt':>7}")
-        print(f"  {'─'*40} {'─'*5} {'─'*7} {'─'*7} {'─'*7}")
+        print(f"  {'-'*40} {'-'*5} {'-'*7} {'-'*7} {'-'*7}")
         for perf in active_agents[:20]:
             name = perf.agent_name[:40]
             print(f"  {name:<40} {perf.total_signals:>5d} {perf.accuracy_30:>6.1f}% "
@@ -447,11 +447,11 @@ def print_performance_report(
 
         # Bottom 10 agents (underperformers)
         if len(active_agents) > 20:
-            print(f"\n{'─' * 80}")
+            print(f"\n{'-' * 80}")
             print(f"  BOTTOM 10 AGENTS (Consider disabling)")
-            print(f"{'─' * 80}")
+            print(f"{'-' * 80}")
             print(f"  {'Agent Name':<40} {'Sigs':>5} {'Acc@30':>7} {'Score':>7} {'New Wt':>7}")
-            print(f"  {'─'*40} {'─'*5} {'─'*7} {'─'*7} {'─'*7}")
+            print(f"  {'-'*40} {'-'*5} {'-'*7} {'-'*7} {'-'*7}")
             for perf in active_agents[-10:]:
                 name = perf.agent_name[:40]
                 print(f"  {name:<40} {perf.total_signals:>5d} {perf.accuracy_30:>6.1f}% "
@@ -459,9 +459,9 @@ def print_performance_report(
 
     # Grid search results
     if grid_results:
-        print(f"\n{'─' * 80}")
+        print(f"\n{'-' * 80}")
         print(f"  PARAMETER OPTIMIZATION RESULTS (Top 5)")
-        print(f"{'─' * 80}")
+        print(f"{'-' * 80}")
         for i, gr in enumerate(grid_results[:10]):
             lev = gr.get('leverage', 1)
             liqs = gr.get('liquidations', 0)
@@ -559,3 +559,404 @@ def load_optimized_weights() -> dict[str, float] | None:
         logger.info(f"Loaded optimized weights from {data.get('timestamp', 'unknown')}")
         return data.get("weights", {})
     return None
+
+
+@dataclass
+class WalkForwardWindow:
+    """Results from a single walk-forward window."""
+    window_index: int
+    train_start: int
+    train_end: int
+    test_start: int
+    test_end: int
+    train_result: BacktestResult | None = None
+    test_result: BacktestResult | None = None
+    optimized_weights: dict = field(default_factory=dict)
+
+
+class WalkForwardOptimizer:
+    """
+    Walk-Forward Optimization: rolling train/test windows to prevent overfitting.
+
+    Instead of training on ALL data and testing on ALL data (in-sample bias),
+    this splits data into rolling windows:
+      [=== TRAIN 1 ===][= TEST 1 =]
+                [=== TRAIN 2 ===][= TEST 2 =]
+                          [=== TRAIN 3 ===][= TEST 3 =]
+
+    Weights learned on each train window are applied out-of-sample on the test window.
+    Final performance is the aggregate of all out-of-sample test windows.
+    """
+
+    def __init__(
+        self,
+        create_agents_fn,
+        symbols: list[str],
+        train_size: int = 3000,
+        test_size: int = 1000,
+        step_size: int = 500,
+    ):
+        self.create_agents_fn = create_agents_fn
+        self.symbols = symbols
+        self.train_size = train_size
+        self.test_size = test_size
+        self.step_size = step_size
+
+    async def run(
+        self,
+        historical_data: dict[str, list[dict]],
+        leverage: float = 1.0,
+    ) -> dict:
+        """
+        Run walk-forward optimization across rolling windows.
+
+        Returns a summary dict with per-window and aggregate results.
+        """
+        symbol = self.symbols[0]
+        all_candles = historical_data.get(symbol, [])
+        if not all_candles:
+            all_candles = list(historical_data.values())[0] if historical_data else []
+
+        total_candles = len(all_candles)
+        min_required = self.train_size + self.test_size
+        if total_candles < min_required:
+            logger.warning(
+                f"Not enough data for walk-forward: {total_candles} candles, "
+                f"need at least {min_required}. Reducing window sizes."
+            )
+            self.train_size = int(total_candles * 0.6)
+            self.test_size = int(total_candles * 0.2)
+            self.step_size = max(self.test_size // 2, 100)
+
+        windows: list[WalkForwardWindow] = []
+        start = 0
+        window_idx = 0
+
+        while start + self.train_size + self.test_size <= total_candles:
+            train_end = start + self.train_size
+            test_end = train_end + self.test_size
+
+            wf = WalkForwardWindow(
+                window_index=window_idx,
+                train_start=start,
+                train_end=train_end,
+                test_start=train_end,
+                test_end=test_end,
+            )
+            windows.append(wf)
+            start += self.step_size
+            window_idx += 1
+
+        logger.info(
+            f"Walk-forward: {len(windows)} windows, "
+            f"train={self.train_size}, test={self.test_size}, step={self.step_size}"
+        )
+
+        # Process each window
+        all_test_trades = []
+        all_test_returns = []
+        all_test_equity = []
+
+        for wf in windows:
+            logger.info(
+                f"  Window {wf.window_index + 1}/{len(windows)}: "
+                f"train[{wf.train_start}:{wf.train_end}] "
+                f"test[{wf.test_start}:{wf.test_end}]"
+            )
+
+            train_data = all_candles[wf.train_start:wf.train_end]
+            test_data = all_candles[wf.test_start:wf.test_end]
+
+            # --- TRAIN: run backtest to learn agent weights ---
+            train_result, weights = await self._train_window(
+                {symbol: train_data}, symbol, leverage
+            )
+            wf.train_result = train_result
+            wf.optimized_weights = weights
+
+            logger.info(
+                f"    Train: Return={train_result.total_return_pct:.2f}%, "
+                f"Sharpe={train_result.sharpe_ratio:.2f}, "
+                f"Trades={train_result.total_trades}"
+            )
+
+            # --- TEST: apply learned weights out-of-sample ---
+            test_result = await self._test_window(
+                {symbol: test_data}, symbol, weights, leverage
+            )
+            wf.test_result = test_result
+
+            logger.info(
+                f"    Test:  Return={test_result.total_return_pct:.2f}%, "
+                f"Sharpe={test_result.sharpe_ratio:.2f}, "
+                f"Trades={test_result.total_trades}"
+            )
+
+            all_test_trades.extend(test_result.trades)
+            all_test_returns.append(test_result.total_return_pct)
+            if test_result.equity_curve:
+                all_test_equity.extend(test_result.equity_curve)
+
+        # --- Aggregate out-of-sample results ---
+        summary = self._aggregate_results(windows, all_test_trades, all_test_returns)
+        summary["leverage"] = leverage
+
+        # Save walk-forward results
+        self._save_results(summary, windows)
+
+        return summary
+
+    async def _train_window(
+        self,
+        data: dict[str, list[dict]],
+        symbol: str,
+        leverage: float,
+    ) -> tuple[BacktestResult, dict[str, float]]:
+        """Run backtest on training data and extract optimized weights."""
+        from ...agents.execution.order_executor import OrderExecutorAgent
+        from ...agents.risk.risk_manager import (
+            PositionSizingAgent, DrawdownMonitorAgent, ExposureManagerAgent,
+        )
+
+        message_bus = MessageBus()
+        registry = AgentRegistry()
+
+        self.create_agents_fn(message_bus, registry, self.symbols)
+
+        pos_sizer = PositionSizingAgent(
+            message_bus, {"max_risk_per_trade": 0.02, "initial_balance": 10000}
+        )
+        registry.register(pos_sizer, "risk", tags=["position_sizing"])
+
+        dd_monitor = DrawdownMonitorAgent(
+            message_bus,
+            {"warning_threshold": 0.05, "reduce_threshold": 0.10, "emergency_threshold": 0.15},
+        )
+        registry.register(dd_monitor, "risk", tags=["drawdown"])
+
+        exposure_mgr = ExposureManagerAgent(
+            message_bus, {"max_leverage": 3.0, "max_single_asset_pct": 0.20}
+        )
+        registry.register(exposure_mgr, "risk", tags=["exposure"])
+
+        executor = OrderExecutorAgent(
+            message_bus, config={"stop_loss_pct": 0.02, "take_profit_pct": 0.04}
+        )
+        registry.register(executor, "execution")
+
+        orchestrator = Orchestrator(message_bus, registry)
+        engine = BacktestEngine(
+            message_bus, initial_balance=10000.0, orchestrator=orchestrator, leverage=leverage
+        )
+
+        await orchestrator.start()
+        result = await engine.run(data[symbol], symbol)
+        await orchestrator.stop()
+
+        # Analyze signals to get weights
+        analyzer = AgentPerformanceAnalyzer()
+        agent_perfs, _ = analyzer.analyze(result.agent_signals)
+        weights = compute_optimized_weights(agent_perfs, registry)
+
+        return result, weights
+
+    async def _test_window(
+        self,
+        data: dict[str, list[dict]],
+        symbol: str,
+        weights: dict[str, float],
+        leverage: float,
+    ) -> BacktestResult:
+        """Run backtest on test data with pre-learned weights applied."""
+        from ...agents.execution.order_executor import OrderExecutorAgent
+        from ...agents.risk.risk_manager import (
+            PositionSizingAgent, DrawdownMonitorAgent, ExposureManagerAgent,
+        )
+
+        message_bus = MessageBus()
+        registry = AgentRegistry()
+
+        self.create_agents_fn(message_bus, registry, self.symbols)
+
+        # Apply learned weights from training
+        apply_optimized_weights(weights, registry)
+
+        pos_sizer = PositionSizingAgent(
+            message_bus, {"max_risk_per_trade": 0.02, "initial_balance": 10000}
+        )
+        registry.register(pos_sizer, "risk", tags=["position_sizing"])
+
+        dd_monitor = DrawdownMonitorAgent(
+            message_bus,
+            {"warning_threshold": 0.05, "reduce_threshold": 0.10, "emergency_threshold": 0.15},
+        )
+        registry.register(dd_monitor, "risk", tags=["drawdown"])
+
+        exposure_mgr = ExposureManagerAgent(
+            message_bus, {"max_leverage": 3.0, "max_single_asset_pct": 0.20}
+        )
+        registry.register(exposure_mgr, "risk", tags=["exposure"])
+
+        executor = OrderExecutorAgent(
+            message_bus, config={"stop_loss_pct": 0.02, "take_profit_pct": 0.04}
+        )
+        registry.register(executor, "execution")
+
+        orchestrator = Orchestrator(message_bus, registry)
+        engine = BacktestEngine(
+            message_bus, initial_balance=10000.0, orchestrator=orchestrator, leverage=leverage
+        )
+
+        await orchestrator.start()
+        result = await engine.run(data[symbol], symbol)
+        await orchestrator.stop()
+
+        return result
+
+    def _aggregate_results(
+        self,
+        windows: list[WalkForwardWindow],
+        all_test_trades: list,
+        all_test_returns: list[float],
+    ) -> dict:
+        """Aggregate out-of-sample test results across all windows."""
+        if not all_test_returns:
+            return {
+                "num_windows": len(windows),
+                "oos_mean_return": 0.0,
+                "oos_total_return": 0.0,
+                "oos_sharpe": 0.0,
+                "oos_total_trades": 0,
+                "oos_win_rate": 0.0,
+                "windows": [],
+            }
+
+        # Compound returns across windows
+        compound_balance = 10000.0
+        for ret in all_test_returns:
+            compound_balance *= (1 + ret / 100)
+        total_return = (compound_balance / 10000.0 - 1) * 100
+
+        # Win rate across all OOS trades
+        winning = sum(1 for t in all_test_trades if t.pnl > 0)
+        total_trades = len(all_test_trades)
+        win_rate = (winning / total_trades * 100) if total_trades > 0 else 0.0
+
+        # OOS Sharpe from per-window returns
+        mean_ret = sum(all_test_returns) / len(all_test_returns)
+        if len(all_test_returns) > 1:
+            variance = sum((r - mean_ret) ** 2 for r in all_test_returns) / (len(all_test_returns) - 1)
+            std_ret = variance ** 0.5
+            oos_sharpe = (mean_ret / std_ret) if std_ret > 0 else 0.0
+        else:
+            oos_sharpe = 0.0
+
+        # Train vs test comparison (overfitting ratio)
+        train_returns = [
+            w.train_result.total_return_pct
+            for w in windows
+            if w.train_result is not None
+        ]
+        avg_train = sum(train_returns) / len(train_returns) if train_returns else 0.0
+        avg_test = mean_ret
+        overfit_ratio = (avg_test / avg_train) if avg_train != 0 else 1.0
+
+        window_details = []
+        for w in windows:
+            detail = {
+                "window": w.window_index,
+                "train_return": w.train_result.total_return_pct if w.train_result else 0.0,
+                "test_return": w.test_result.total_return_pct if w.test_result else 0.0,
+                "train_sharpe": w.train_result.sharpe_ratio if w.train_result else 0.0,
+                "test_sharpe": w.test_result.sharpe_ratio if w.test_result else 0.0,
+                "train_trades": w.train_result.total_trades if w.train_result else 0,
+                "test_trades": w.test_result.total_trades if w.test_result else 0,
+            }
+            window_details.append(detail)
+
+        return {
+            "num_windows": len(windows),
+            "oos_mean_return": round(mean_ret, 4),
+            "oos_total_return": round(total_return, 4),
+            "oos_compound_balance": round(compound_balance, 2),
+            "oos_sharpe": round(oos_sharpe, 4),
+            "oos_total_trades": total_trades,
+            "oos_win_rate": round(win_rate, 1),
+            "avg_train_return": round(avg_train, 4),
+            "overfit_ratio": round(overfit_ratio, 4),
+            "windows": window_details,
+        }
+
+    def _save_results(self, summary: dict, windows: list[WalkForwardWindow]):
+        """Save walk-forward results to disk."""
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+        filepath = RESULTS_DIR / f"walkforward_{timestamp}.json"
+        output = {"timestamp": timestamp, **summary}
+        with open(filepath, "w") as f:
+            json.dump(output, f, indent=2)
+
+        # Save the weights from the LAST window (most recent data)
+        if windows and windows[-1].optimized_weights:
+            latest = RESULTS_DIR / "latest_weights.json"
+            with open(latest, "w") as f:
+                json.dump(
+                    {"weights": windows[-1].optimized_weights, "timestamp": timestamp,
+                     "source": "walk_forward"},
+                    f, indent=2,
+                )
+            logger.info(f"Walk-forward weights saved from last window")
+
+        logger.info(f"Walk-forward results saved to {filepath}")
+        return filepath
+
+
+def print_walkforward_report(summary: dict):
+    """Print walk-forward optimization results."""
+    print("\n" + "=" * 80)
+    print("  WALK-FORWARD OPTIMIZATION REPORT")
+    print("=" * 80)
+
+    lev = summary.get("leverage", 1)
+    lev_str = f"  Leverage:              {lev:.0f}x\n" if lev > 1 else ""
+
+    print(f"\n{'-' * 50}")
+    print("  OUT-OF-SAMPLE AGGREGATE RESULTS")
+    print(f"{'-' * 50}")
+    print(lev_str, end="")
+    print(f"  Windows:               {summary['num_windows']}")
+    print(f"  OOS Mean Return:       {summary['oos_mean_return']:.2f}%")
+    print(f"  OOS Total Return:      {summary['oos_total_return']:.2f}%")
+    print(f"  OOS Compound Balance: ${summary.get('oos_compound_balance', 10000):.2f}")
+    print(f"  OOS Sharpe Ratio:      {summary['oos_sharpe']:.2f}")
+    print(f"  OOS Total Trades:      {summary['oos_total_trades']}")
+    print(f"  OOS Win Rate:          {summary['oos_win_rate']:.1f}%")
+    print(f"  Avg Train Return:      {summary.get('avg_train_return', 0):.2f}%")
+
+    overfit = summary.get("overfit_ratio", 1.0)
+    if overfit > 0.8:
+        label = "GOOD (low overfitting)"
+    elif overfit > 0.5:
+        label = "OK (moderate overfitting)"
+    else:
+        label = "POOR (significant overfitting)"
+    print(f"  Overfit Ratio:         {overfit:.2f} - {label}")
+
+    # Per-window breakdown
+    windows = summary.get("windows", [])
+    if windows:
+        print(f"\n{'-' * 70}")
+        print("  PER-WINDOW BREAKDOWN")
+        print(f"{'-' * 70}")
+        print(f"  {'Window':>6} {'Train Ret':>10} {'Test Ret':>10} "
+              f"{'Train Shrp':>11} {'Test Shrp':>10} {'Trades':>7}")
+        print(f"  {'-'*6} {'-'*10} {'-'*10} {'-'*11} {'-'*10} {'-'*7}")
+        for w in windows:
+            print(
+                f"  {w['window']+1:>6} {w['train_return']:>9.2f}% "
+                f"{w['test_return']:>9.2f}% {w['train_sharpe']:>11.2f} "
+                f"{w['test_sharpe']:>10.2f} {w['test_trades']:>7}"
+            )
+
+    print("\n" + "=" * 80)

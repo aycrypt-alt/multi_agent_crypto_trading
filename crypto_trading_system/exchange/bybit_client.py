@@ -44,7 +44,7 @@ class BybitClient:
         self.api_key = os.environ.get("BYBIT_API_KEY", "")
         self.api_secret = os.environ.get("BYBIT_API_SECRET", "")
         self.base_url = self.BASE_URL_TESTNET if testnet else self.BASE_URL_MAINNET
-        self.recv_window = 5000
+        self.recv_window = 20000  # 20s window to handle clock drift
         self._session = None
         self._rate_limit_remaining = 120
         self._rate_limit_reset = 0
@@ -57,18 +57,18 @@ class BybitClient:
             except ImportError:
                 raise ImportError("Install aiohttp: pip install aiohttp")
 
-    def _sign(self, params: dict, timestamp: int) -> str:
-        """Generate HMAC SHA256 signature for authenticated requests."""
-        param_str = f"{timestamp}{self.api_key}{self.recv_window}{urlencode(sorted(params.items()))}"
+    def _sign(self, payload_str: str, timestamp: int) -> str:
+        """Generate HMAC SHA256 signature for Bybit V5 API."""
+        sign_str = f"{timestamp}{self.api_key}{self.recv_window}{payload_str}"
         return hmac.new(
             self.api_secret.encode("utf-8"),
-            param_str.encode("utf-8"),
+            sign_str.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
 
-    def _auth_headers(self, params: dict) -> dict:
+    def _auth_headers(self, payload_str: str) -> dict:
         timestamp = int(time.time() * 1000)
-        signature = self._sign(params, timestamp)
+        signature = self._sign(payload_str, timestamp)
         return {
             "X-BAPI-API-KEY": self.api_key,
             "X-BAPI-SIGN": signature,
@@ -77,12 +77,38 @@ class BybitClient:
             "Content-Type": "application/json",
         }
 
+    async def _get_server_time_offset(self) -> int:
+        """Get offset between local time and Bybit server time in ms."""
+        await self._ensure_session()
+        url = f"{self.base_url}/v5/market/time"
+        async with self._session.get(url) as resp:
+            data = await resp.json()
+            server_time = int(data.get("result", {}).get("timeNano", "0")) // 1_000_000
+            local_time = int(time.time() * 1000)
+            self._time_offset = server_time - local_time
+            return self._time_offset
+
     async def _request(self, method: str, endpoint: str, params: dict | None = None,
                        authenticated: bool = False) -> dict:
         await self._ensure_session()
         url = f"{self.base_url}{endpoint}"
         params = params or {}
-        headers = self._auth_headers(params) if authenticated else {"Content-Type": "application/json"}
+
+        if authenticated:
+            # Sync time offset on first authenticated call
+            if not hasattr(self, '_time_offset'):
+                await self._get_server_time_offset()
+
+            if method == "GET":
+                # GET: sign query string
+                query_str = urlencode(sorted(params.items())) if params else ""
+                headers = self._auth_headers_with_offset(query_str)
+            else:
+                # POST: sign JSON body
+                body_str = json.dumps(params) if params else ""
+                headers = self._auth_headers_with_offset(body_str)
+        else:
+            headers = {"Content-Type": "application/json"}
 
         # Rate limit check
         if self._rate_limit_remaining <= 1 and time.time() < self._rate_limit_reset:
@@ -90,18 +116,38 @@ class BybitClient:
             logger.warning(f"Rate limited, waiting {wait:.1f}s")
             await asyncio.sleep(wait)
 
-        async with self._session.request(method, url, json=params if method == "POST" else None,
-                                          params=params if method == "GET" else None,
-                                          headers=headers) as resp:
-            # Update rate limit tracking
-            self._rate_limit_remaining = int(resp.headers.get("X-Bapi-Limit-Status", 120))
-            reset = resp.headers.get("X-Bapi-Limit-Reset-Timestamp", "0")
-            self._rate_limit_reset = int(reset) / 1000 if reset != "0" else 0
+        if method == "GET":
+            async with self._session.get(url, params=params, headers=headers) as resp:
+                return await self._handle_response(resp)
+        else:
+            async with self._session.post(url, json=params, headers=headers) as resp:
+                return await self._handle_response(resp)
 
-            data = await resp.json()
-            if data.get("retCode") != 0:
-                logger.error(f"Bybit API error: {data.get('retMsg')} (code: {data.get('retCode')})")
-            return data
+    def _auth_headers_with_offset(self, payload_str: str) -> dict:
+        """Auth headers using server-synced timestamp."""
+        timestamp = int(time.time() * 1000) + getattr(self, '_time_offset', 0)
+        signature = self._sign(payload_str, timestamp)
+        return {
+            "X-BAPI-API-KEY": self.api_key,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-TIMESTAMP": str(timestamp),
+            "X-BAPI-RECV-WINDOW": str(self.recv_window),
+            "Content-Type": "application/json",
+        }
+
+    async def _handle_response(self, resp) -> dict:
+        """Process API response, track rate limits."""
+        self._rate_limit_remaining = int(resp.headers.get("X-Bapi-Limit-Status", 120))
+        reset = resp.headers.get("X-Bapi-Limit-Reset-Timestamp", "0")
+        self._rate_limit_reset = int(reset) / 1000 if reset != "0" else 0
+
+        data = await resp.json()
+        if data is None:
+            logger.error(f"Bybit API returned null response (HTTP {resp.status})")
+            return {"retCode": -1, "retMsg": "null response"}
+        if data.get("retCode") != 0:
+            logger.error(f"Bybit API error: {data.get('retMsg')} (code: {data.get('retCode')})")
+        return data
 
     async def close(self):
         if self._session:
@@ -248,9 +294,9 @@ class BybitClient:
                 "available_balance": float(accounts[0].get("totalAvailableBalance", 0)),
                 "coins": {
                     c["coin"]: {
-                        "equity": float(c.get("equity", 0)),
-                        "available": float(c.get("availableToWithdraw", 0)),
-                        "unrealized_pnl": float(c.get("unrealisedPnl", 0)),
+                        "equity": float(c.get("equity") or 0),
+                        "available": float(c.get("availableToWithdraw") or 0),
+                        "unrealized_pnl": float(c.get("unrealisedPnl") or 0),
                     }
                     for c in coins
                 },

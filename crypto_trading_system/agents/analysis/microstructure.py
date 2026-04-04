@@ -28,7 +28,7 @@ class FundingRateAgent(Agent):
     BEFORE the liquidation cascade happens.
     """
 
-    SIGNAL_COOLDOWN = 20
+    SIGNAL_COOLDOWN = 10
 
     # Thresholds for extreme funding (annualized %)
     EXTREME_POSITIVE = 0.03    # 0.03% per 8h = ~33% annual = very bullish crowd
@@ -178,7 +178,7 @@ class OpenInterestAgent(Agent):
     OI divergence from price is one of the strongest leading signals in crypto.
     """
 
-    SIGNAL_COOLDOWN = 15
+    SIGNAL_COOLDOWN = 10
     OI_CHANGE_THRESHOLD = 0.02  # 2% OI change to be significant
 
     def __init__(self, message_bus: MessageBus, symbol: str):
@@ -314,7 +314,7 @@ class LiquidationLevelAgent(Agent):
     recent price action and typical leverage levels in crypto.
     """
 
-    SIGNAL_COOLDOWN = 20
+    SIGNAL_COOLDOWN = 10
 
     # Typical leverage levels in crypto and their liquidation distances
     LEVERAGE_LEVELS = [5, 10, 25, 50, 100]

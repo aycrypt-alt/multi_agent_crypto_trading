@@ -18,7 +18,7 @@ class ROCMomentumAgent(Agent):
     """Rate of Change momentum — enters when ROC accelerates.
     Enhanced with higher threshold, ADX confirmation, and longer cooldown."""
 
-    SIGNAL_COOLDOWN = 15
+    SIGNAL_COOLDOWN = 8
 
     def __init__(self, message_bus: MessageBus, symbol: str, period: int = 12, threshold: float = 3.0):
         super().__init__(
@@ -86,7 +86,7 @@ class ROCMomentumAgent(Agent):
 class VolumeWeightedMomentumAgent(Agent):
     """Momentum weighted by volume — stronger volume = stronger conviction."""
 
-    SIGNAL_COOLDOWN = 15  # Minimum candles between signals
+    SIGNAL_COOLDOWN = 8  # Minimum candles between signals
 
     def __init__(self, message_bus: MessageBus, symbol: str, period: int = 14):
         super().__init__(
@@ -165,7 +165,7 @@ class MultiTimeframeMomentumAgent(Agent):
     Signal only fires when short, medium, and long-term momentum align.
     """
 
-    SIGNAL_COOLDOWN = 15
+    SIGNAL_COOLDOWN = 8
     MIN_MOMENTUM = 0.005  # Minimum 0.5% move required per timeframe
 
     def __init__(self, message_bus: MessageBus, symbol: str):

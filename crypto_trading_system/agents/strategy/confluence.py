@@ -19,6 +19,7 @@ from ...core.message_bus import Message, MessageBus, MessageType
 from ...utils.indicators import (
     ema, sma, rsi, macd, bollinger_bands, adx, atr, volume_ratio,
 )
+from .mean_reversion import _in_strong_trend
 
 
 class MeanReversionConfluenceAgent(Agent):
@@ -33,8 +34,8 @@ class MeanReversionConfluenceAgent(Agent):
     Only fires when >= 3 indicators align. Much fewer but much better signals.
     """
 
-    SIGNAL_COOLDOWN = 15
-    MIN_CONFIRMATIONS = 4
+    SIGNAL_COOLDOWN = 8
+    MIN_CONFIRMATIONS = 3
 
     def __init__(self, message_bus: MessageBus, symbol: str):
         super().__init__(
@@ -67,6 +68,10 @@ class MeanReversionConfluenceAgent(Agent):
             return None
 
         if self._candle_count - self._last_signal_candle < self.SIGNAL_COOLDOWN:
+            return None
+
+        # TREND FILTER: mean reversion confluence should not fire in strong trends
+        if _in_strong_trend(self._prices, self._highs, self._lows):
             return None
 
         # Evaluate each indicator independently
@@ -173,8 +178,8 @@ class TrendConfluenceAgent(Agent):
     Only fires when >= 3 indicators align on direction.
     """
 
-    SIGNAL_COOLDOWN = 15
-    MIN_CONFIRMATIONS = 4
+    SIGNAL_COOLDOWN = 8
+    MIN_CONFIRMATIONS = 3
 
     def __init__(self, message_bus: MessageBus, symbol: str):
         super().__init__(
@@ -307,8 +312,8 @@ class MomentumConfluenceAgent(Agent):
     Momentum signals work best when the move has just started, not at extremes.
     """
 
-    SIGNAL_COOLDOWN = 15
-    MIN_CONFIRMATIONS = 4
+    SIGNAL_COOLDOWN = 8
+    MIN_CONFIRMATIONS = 3
     ROC_THRESHOLD = 1.5  # percent
 
     def __init__(self, message_bus: MessageBus, symbol: str):

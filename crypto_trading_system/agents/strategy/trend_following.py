@@ -106,7 +106,7 @@ class MACDAgent(Agent):
     Enhanced: requires histogram to exceed a minimum threshold relative to price,
     and confirms with ADX trend presence."""
 
-    SIGNAL_COOLDOWN = 15
+    SIGNAL_COOLDOWN = 8
 
     def __init__(self, message_bus: MessageBus, symbol: str):
         super().__init__(
@@ -189,7 +189,7 @@ class BreakoutAgent(Agent):
     """Donchian channel breakout detection.
     Enhanced with volume confirmation and cooldown — only signals on high-volume breakouts."""
 
-    SIGNAL_COOLDOWN = 18
+    SIGNAL_COOLDOWN = 10
 
     def __init__(self, message_bus: MessageBus, symbol: str, lookback: int = 20):
         super().__init__(

@@ -143,6 +143,15 @@ class Agent(ABC):
     async def _handle_message(self, message: Message):
         if self.state != AgentState.RUNNING:
             return
+        
+        # Check if muted and try to unmute after cooldown
+        if self._is_muted:
+            if self._candle_idx - self._mute_candle_idx >= self.MUTE_COOLDOWN:
+                logger.info(f"Agent {self.name} unmuted after cooldown period")
+                self._is_muted = False
+            else:
+                return  # Skip processing while muted
+        
         self.metrics.messages_received += 1
         self.metrics.last_active = time.time()
 
@@ -173,6 +182,10 @@ class Agent(ABC):
     CONFIDENCE_FLOOR = 0.2     # Never go below this confidence
     CONFIDENCE_CEILING = 1.5   # Allow above 1.0 for consistently accurate agents
     ADAPT_RATE = 0.15          # How fast confidence adjusts (0=never, 1=instant)
+    VOLATILITY_WINDOW = 20     # Window for volatility calculation
+    VOLATILITY_THRESHOLD = 0.02 # 2% price change threshold for high vol
+    LOSING_STREAK_MUTE = 10    # Increased from 5 - require more consecutive losses
+    MUTE_COOLDOWN = 20         # New: candles to wait before unmuting
 
     def _init_learning(self):
         """Initialize adaptive learning state. Call from subclass __init__ after super().__init__."""
@@ -185,12 +198,55 @@ class Agent(ABC):
         self._regime_accuracy: dict[str, list[bool]] = {
             "trending": [], "ranging": [], "unknown": []
         }
+        # Volatility-adaptive state
+        self._volatility: float = 0.0
+        self._volatility_regime: str = "normal"  # "low", "normal", "high"
+        self._recent_returns: deque[float] = deque(maxlen=self.VOLATILITY_WINDOW)
+        self._dynamic_cooldown_multiplier: float = 1.0
+        # Mute tracking
+        self._is_muted: bool = False
+        self._mute_candle_idx: int = -self.MUTE_COOLDOWN
 
     def record_price(self, price: float):
-        """Called each candle to track prices for signal evaluation."""
+        """Called each candle to track prices for signal evaluation and volatility."""
         self._price_buffer.append(price)
         self._candle_idx += 1
+        
+        # Calculate volatility for adaptive behavior
+        if len(self._price_buffer) >= 2:
+            ret = (price - self._price_buffer[-2]) / self._price_buffer[-2]
+            self._recent_returns.append(ret)
+            if len(self._recent_returns) >= 5:
+                self._volatility = math.sqrt(sum(r**2 for r in self._recent_returns) / len(self._recent_returns))
+                # Classify volatility regime
+                if self._volatility < 0.005:
+                    self._volatility_regime = "low"
+                    self._dynamic_cooldown_multiplier = 1.5
+                elif self._volatility > 0.02:
+                    self._volatility_regime = "high"
+                    self._dynamic_cooldown_multiplier = 0.5
+                else:
+                    self._volatility_regime = "normal"
+                    self._dynamic_cooldown_multiplier = 1.0
+                
         self._evaluate_pending_signals()
+
+    def get_volatility(self) -> float:
+        """Return current volatility for this agent's symbol."""
+        return self._volatility
+
+    def get_volatility_regime(self) -> str:
+        """Return 'low', 'normal', or 'high' based on recent volatility."""
+        return self._volatility_regime
+
+    def get_adaptive_threshold(self, base_threshold: float, multiplier: float = 1.0) -> float:
+        """Get a threshold adjusted for current volatility."""
+        vol_adjustment = 1.0 + (self._volatility * 10)  # Scale volatility impact
+        return base_threshold * vol_adjustment * multiplier
+
+    def get_adaptive_cooldown(self, base_cooldown: int) -> int:
+        """Get cooldown adjusted for volatility (faster in high vol)."""
+        return int(base_cooldown * self._dynamic_cooldown_multiplier)
 
     def record_signal(self, direction: str, price: float, regime: str = "unknown"):
         """Record a signal for later accuracy evaluation."""
@@ -247,13 +303,13 @@ class Agent(ABC):
             self._update_confidence()
 
     def _update_confidence(self):
-        """Adapt confidence based on rolling accuracy using exponential smoothing."""
+        """Adapt confidence based on rolling accuracy — punish losers hard, reward winners."""
         evaluated = [s for s in self._signal_history if s["evaluated"]]
         if len(evaluated) < self.MIN_SIGNALS_TO_ADAPT:
             return
 
-        # Exponentially weighted accuracy — recent signals matter more
-        alpha = 0.1  # Decay factor
+        # Exponentially weighted accuracy — recent signals matter much more
+        alpha = 0.15  # Steeper decay = recent signals dominate
         weighted_correct = 0.0
         total_weight = 0.0
         for i, sig in enumerate(evaluated):
@@ -263,16 +319,37 @@ class Agent(ABC):
 
         self._rolling_accuracy = weighted_correct / total_weight if total_weight > 0 else 0.5
 
-        # Map accuracy to confidence: 50% accuracy = base, above = boost, below = reduce
-        # Using a sigmoid-like curve centered at 0.5
+        # PUNISHMENT: agents below 45% accuracy get hammered
+        # REWARD: agents above 55% accuracy get boosted
         accuracy_edge = self._rolling_accuracy - 0.5
-        target_confidence = self._base_confidence * (1.0 + accuracy_edge * 3.0)
+        if accuracy_edge < -0.05:
+            # Losing agent — punish with steeper curve
+            target_confidence = self._base_confidence * (1.0 + accuracy_edge * 5.0)
+        else:
+            # Winning or neutral agent — standard reward
+            target_confidence = self._base_confidence * (1.0 + accuracy_edge * 3.0)
 
-        # Streak bonus/penalty — consecutive wins/losses amplify adjustment
-        streak_factor = 1.0 + min(abs(self._streak), 5) * 0.05 * (1 if self._streak > 0 else -1)
-        target_confidence *= streak_factor
+        # Streak punishment — consecutive losses crush confidence fast
+        if self._streak <= -self.LOSING_STREAK_MUTE:
+            # Agent is on a bad losing streak — effectively mute it
+            target_confidence = self.CONFIDENCE_FLOOR
+            if not self._is_muted:
+                self._is_muted = True
+                self._mute_candle_idx = self._candle_idx
+                logger.warning(
+                    f"Agent {self.name} MUTED: {abs(self._streak)} consecutive losses, "
+                    f"accuracy {self._rolling_accuracy:.1%}"
+                )
+        elif self._streak < 0:
+            # Losing streak penalty (escalating)
+            streak_penalty = 1.0 - min(abs(self._streak), 5) * 0.12
+            target_confidence *= streak_penalty
+        elif self._streak > 0:
+            # Winning streak bonus (moderate)
+            streak_bonus = 1.0 + min(self._streak, 5) * 0.06
+            target_confidence *= streak_bonus
 
-        # Smooth adjustment
+        # Fast adaptation — move toward target aggressively
         self._confidence = self._confidence + self.ADAPT_RATE * (target_confidence - self._confidence)
         self._confidence = max(self.CONFIDENCE_FLOOR, min(self.CONFIDENCE_CEILING, self._confidence))
 

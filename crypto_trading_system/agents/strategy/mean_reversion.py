@@ -11,14 +11,42 @@ import math
 
 from ...core.agent_base import Agent, AgentPriority
 from ...core.message_bus import Message, MessageBus, MessageType
-from ...utils.indicators import bollinger_bands, rsi, sma, adx, volume_ratio
+from ...utils.indicators import bollinger_bands, rsi, sma, ema, adx, volume_ratio
+
+
+def _in_strong_trend(prices: list[float], highs: list[float], lows: list[float]) -> bool:
+    """Multi-factor trend filter for mean-reversion agents.
+    Returns True if the market is trending too strongly for mean reversion to work."""
+    if len(prices) < 50:
+        return False
+
+    # 1. ADX > 28 = strong trend
+    adx_values = adx(highs, lows, prices, 14)
+    if adx_values and adx_values[-1] > 28:
+        return True
+
+    # 2. SMA slope — if 20-SMA is moving >0.15% per bar, trend is strong
+    sma_20 = sma(prices, 20)
+    if sma_20 and len(sma_20) >= 10:
+        slope = (sma_20[-1] - sma_20[-10]) / sma_20[-10] * 100
+        if abs(slope) > 1.5:  # 1.5% move over 10 bars
+            return True
+
+    # 3. Price far from EMA50 — if price is >2% away, we're in a trend move
+    ema_50 = ema(prices, 50)
+    if ema_50:
+        distance = abs(prices[-1] - ema_50[-1]) / ema_50[-1]
+        if distance > 0.02:
+            return True
+
+    return False
 
 
 class BollingerReversionAgent(Agent):
     """Trade mean reversion when price touches Bollinger Bands.
     Enhanced with RSI confirmation, volume filter, ADX trend rejection, and cooldown."""
 
-    SIGNAL_COOLDOWN = 15  # Minimum candles between signals
+    SIGNAL_COOLDOWN = 8  # Minimum candles between signals
 
     def __init__(self, message_bus: MessageBus, symbol: str, period: int = 20, std_dev: float = 2.0):
         super().__init__(
@@ -56,9 +84,8 @@ class BollingerReversionAgent(Agent):
         if self._candle_count - self._last_signal_candle < self.SIGNAL_COOLDOWN:
             return None
 
-        # Reject signals during strong trends (ADX > 30)
-        adx_values = adx(self._highs, self._lows, self._prices, 14)
-        if adx_values and adx_values[-1] > 30:
+        # TREND FILTER: mean reversion in a strong trend = getting run over
+        if _in_strong_trend(self._prices, self._highs, self._lows):
             return None
 
         bands = bollinger_bands(self._prices, self.period, self.std_dev)
@@ -113,7 +140,7 @@ class RSIReversionAgent(Agent):
     """Trade RSI extremes — oversold bounces and overbought reversals.
     Enhanced with tighter thresholds, ADX filter, and cooldown."""
 
-    SIGNAL_COOLDOWN = 15
+    SIGNAL_COOLDOWN = 8
 
     def __init__(
         self, message_bus: MessageBus, symbol: str,
@@ -156,9 +183,8 @@ class RSIReversionAgent(Agent):
             self._prev_rsi = rsi_values[-1]
             return None
 
-        # Reject during strong trends
-        adx_values = adx(self._highs, self._lows, self._prices, 14)
-        if adx_values and adx_values[-1] > 30:
+        # TREND FILTER: don't fight the trend
+        if _in_strong_trend(self._prices, self._highs, self._lows):
             self._prev_rsi = rsi_values[-1]
             return None
 
@@ -199,7 +225,7 @@ class ZScoreReversionAgent(Agent):
     """Statistical mean reversion based on Z-Score of price relative to its mean.
     Enhanced with higher threshold, ADX filter, cooldown, and mean-reversion confirmation."""
 
-    SIGNAL_COOLDOWN = 15
+    SIGNAL_COOLDOWN = 8
 
     def __init__(self, message_bus: MessageBus, symbol: str, lookback: int = 50, threshold: float = 2.5):
         super().__init__(
@@ -236,9 +262,8 @@ class ZScoreReversionAgent(Agent):
         if self._candle_count - self._last_signal_candle < self.SIGNAL_COOLDOWN:
             return None
 
-        # Reject during strong trends
-        adx_values = adx(self._highs, self._lows, self._prices, 14)
-        if adx_values and adx_values[-1] > 30:
+        # TREND FILTER: z-score reversion fails in trends
+        if _in_strong_trend(self._prices, self._highs, self._lows):
             return None
 
         window = self._prices[-self.lookback:]

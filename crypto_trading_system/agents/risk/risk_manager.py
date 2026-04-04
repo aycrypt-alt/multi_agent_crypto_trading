@@ -34,10 +34,11 @@ class PositionSizingAgent(Agent):
             priority=AgentPriority.CRITICAL,
             config=config or {},
         )
-        self.max_risk_per_trade = self.config.get("max_risk_per_trade", 0.02)  # 2% max risk
-        self.max_portfolio_risk = self.config.get("max_portfolio_risk", 0.06)  # 6% total
+        self.max_risk_per_trade = self.config.get("max_risk_per_trade", 0.03)  # 3% per trade
+        self.max_portfolio_risk = self.config.get("max_portfolio_risk", 0.05)  # Reduced from 6% to 5%
+        self.leverage = self.config.get("leverage", 1.0)  # Pass leverage from config
         self.account_balance = self.config.get("initial_balance", 10000.0)
-        self._open_risk = 0.0  # Currently risked amount
+        self._open_risk = 0.0
         self._win_rate = 0.5
         self._avg_win = 1.0
         self._avg_loss = 1.0
@@ -67,7 +68,6 @@ class PositionSizingAgent(Agent):
         if direction == "neutral":
             return None
 
-        # Check portfolio-level risk limit
         if self._open_risk >= self.max_portfolio_risk * self.account_balance:
             await self.emit(
                 MessageType.RISK_ALERT,
@@ -77,19 +77,19 @@ class PositionSizingAgent(Agent):
             )
             return {"action": "reject", "reason": "portfolio_risk_limit"}
 
-        # Kelly Criterion
         kelly_fraction = self._kelly_criterion()
 
-        # Conservative: use half-Kelly
-        position_fraction = kelly_fraction * 0.5
+        risk_fraction = min(kelly_fraction, self.max_risk_per_trade)
 
-        # Cap at max risk per trade
-        position_fraction = min(position_fraction, self.max_risk_per_trade)
+        # Leverage-aware scaling: reduce position size as leverage increases
+        leverage_factor = 1.0 / math.sqrt(self.leverage) if self.leverage > 1 else 1.0
 
-        # Scale by signal strength and confidence
-        position_fraction *= strength * confidence
+        # Scale by signal strength and confidence, but floor at 40% of base
+        signal_scale = max(strength * confidence, 0.4)
+        position_fraction = risk_fraction * signal_scale * leverage_factor
 
-        position_size_usd = self.account_balance * position_fraction
+        # Position size is the margin amount (leverage-aware stops protect from liquidation)
+        position_size_usd = max(self.account_balance * position_fraction, 10.0)
 
         order = {
             "symbol": symbol,
@@ -98,6 +98,7 @@ class PositionSizingAgent(Agent):
             "position_fraction": round(position_fraction, 4),
             "kelly_fraction": round(kelly_fraction, 4),
             "risk_amount": round(position_size_usd * self.max_risk_per_trade, 2),
+            "leverage_factor": round(leverage_factor, 3),
         }
 
         await self.emit(
@@ -109,8 +110,7 @@ class PositionSizingAgent(Agent):
         return order
 
     def _kelly_criterion(self) -> float:
-        """Kelly Criterion: f* = (bp - q) / b where b = avg_win/avg_loss."""
-        # Not enough trade history — use conservative fixed fraction
+        """Kelly Criterion with half-Kelly for conservatism."""
         if len(self._trade_history) < 5:
             return self.max_risk_per_trade
         if self._avg_loss == 0:
@@ -119,8 +119,8 @@ class PositionSizingAgent(Agent):
         p = self._win_rate
         q = 1 - p
         kelly = (b * p - q) / b
-        # Floor at a small fraction so we still take trades even with poor stats
-        return max(0.001, min(kelly, 0.25))
+        # Full Kelly, capped at 25%
+        return max(0.005, min(kelly, 0.25))
 
     def _update_balance(self, message: Message) -> dict | None:
         pnl = message.payload.get("pnl", 0.0)

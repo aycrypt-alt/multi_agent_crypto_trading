@@ -29,15 +29,17 @@ class PositionManagerAgent(Agent):
     """
 
     # Must match backtester settings exactly
-    ATR_SL_MULT = 1.8
-    ATR_TP_MULT = 1.5
+    ATR_SL_MULT = 1.5
+    ATR_TP_MULT = 3.0
     ATR_PERIOD = 14
     TRAIL_ACTIVATION_ATR = 0.3
     TRAIL_DISTANCE_ATR = 0.6
     MAX_HOLD_CANDLES = 12
     FEE_RATE = 0.00075
+    DEFAULT_LEVERAGE = 25
 
-    def __init__(self, message_bus: MessageBus, exchange_client=None, symbols: list[str] = None):
+    def __init__(self, message_bus: MessageBus, exchange_client=None, symbols: list[str] = None,
+                 leverage: int = 25):
         super().__init__(
             name="position_manager",
             message_bus=message_bus,
@@ -45,6 +47,7 @@ class PositionManagerAgent(Agent):
         )
         self.exchange = exchange_client
         self.symbols = symbols or []
+        self.leverage = leverage
         # Track positions: {symbol: {direction, entry_price, entry_candle, best_price, ...}}
         self._positions: dict[str, dict] = {}
         # OHLC for ATR
@@ -87,13 +90,22 @@ class PositionManagerAgent(Agent):
         # Compute ATR for this symbol
         current_atr = self._compute_atr(symbol)
 
+        # Leverage-aware stop: ensure SL is always tighter than liquidation distance
+        if self.leverage > 1:
+            max_sl_distance = fill_price * (0.95 / self.leverage) * 0.6
+            sl_distance = min(current_atr * self.ATR_SL_MULT, max_sl_distance)
+            tp_distance = min(current_atr * self.ATR_TP_MULT, max_sl_distance * 2.5)
+        else:
+            sl_distance = current_atr * self.ATR_SL_MULT
+            tp_distance = current_atr * self.ATR_TP_MULT
+
         # Set ATR-based SL/TP
         if direction == "long":
-            stop_loss = fill_price - current_atr * self.ATR_SL_MULT
-            take_profit = fill_price + current_atr * self.ATR_TP_MULT
+            stop_loss = fill_price - sl_distance
+            take_profit = fill_price + tp_distance
         else:
-            stop_loss = fill_price + current_atr * self.ATR_SL_MULT
-            take_profit = fill_price - current_atr * self.ATR_TP_MULT
+            stop_loss = fill_price + sl_distance
+            take_profit = fill_price - tp_distance
 
         self._positions[symbol] = {
             "direction": direction,

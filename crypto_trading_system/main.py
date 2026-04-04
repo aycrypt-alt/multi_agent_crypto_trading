@@ -225,21 +225,26 @@ def create_agents(message_bus: MessageBus, registry: AgentRegistry, symbols: lis
     agent_count = create_strategy_agents(message_bus, registry, symbols)
 
     # ── Risk Management (system-wide) ──
-    agent = PositionSizingAgent(message_bus, {"max_risk_per_trade": 0.02, "initial_balance": 10000})
+    agent = PositionSizingAgent(message_bus, {
+        "max_risk_per_trade": 0.015,
+        "max_portfolio_risk": 0.05,
+        "leverage": 1.0,
+        "initial_balance": 10000
+    })
     registry.register(agent, "risk", tags=["position_sizing"])
     agent_count += 1
 
     agent = DrawdownMonitorAgent(message_bus, {
-        "warning_threshold": 0.05,
-        "reduce_threshold": 0.10,
-        "emergency_threshold": 0.15,
+        "warning_threshold": 0.03,
+        "reduce_threshold": 0.07,
+        "emergency_threshold": 0.12,
     })
     registry.register(agent, "risk", tags=["drawdown"])
     agent_count += 1
 
     agent = ExposureManagerAgent(message_bus, {
         "max_leverage": 3.0,
-        "max_single_asset_pct": 0.20,
+        "max_single_asset_pct": 0.15,
     })
     registry.register(agent, "risk", tags=["exposure"])
     agent_count += 1
@@ -281,7 +286,7 @@ async def run_live(symbols: list[str], testnet: bool = True, leverage: int = 25)
 
     # Add position manager — handles trailing stops, breakeven, time exits
     # This is what drives the 60%+ win rate from backtesting in live mode
-    pos_manager = PositionManagerAgent(message_bus, exchange_client=exchange, symbols=symbols)
+    pos_manager = PositionManagerAgent(message_bus, exchange_client=exchange, symbols=symbols, leverage=leverage)
     registry.register(pos_manager, "execution", tags=["position_manager"])
 
     # Create and start orchestrator
@@ -447,7 +452,7 @@ async def run_optimize(symbols: list[str], use_real_data: bool = False,
         prices = {"BTCUSDT": 50000, "ETHUSDT": 3000, "SOLUSDT": 100}
         for sym in backtest_symbols:
             start_price = prices.get(sym, 100)
-            historical_data[sym] = generate_synthetic_data(sym, num_candles=5000, start_price=start_price)
+            historical_data[sym] = generate_synthetic_data(sym, num_candles=2000, start_price=start_price)
 
     # ── Step 2: Run backtest with signal tracking ──
     lev_str = f" (leverage: {leverage:.0f}x)" if leverage > 1 else ""
@@ -456,6 +461,11 @@ async def run_optimize(symbols: list[str], use_real_data: bool = False,
     registry = AgentRegistry()
 
     create_agents(message_bus, registry, backtest_symbols)
+
+    # Set leverage in position sizer for leverage-aware position sizing
+    pos_sizer = registry.get_by_name("position_sizer")
+    if pos_sizer and hasattr(pos_sizer, 'leverage'):
+        pos_sizer.leverage = leverage
 
     executor = OrderExecutorAgent(message_bus, config={"stop_loss_pct": 0.02, "take_profit_pct": 0.04})
     registry.register(executor, "execution")

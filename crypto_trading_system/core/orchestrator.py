@@ -100,8 +100,8 @@ class Orchestrator:
         # Entry confirmation buffer: signals wait here for price confirmation
         # {symbol: {"signal": AggregatedSignal, "entry_price": float, "candle_idx": int, "wait_candles": 0}}
         self._pending_confirmations: dict[str, dict] = {}
-        self.CONFIRMATION_WAIT = 2      # Wait up to 2 candles for confirmation
-        self.CONFIRMATION_MOVE = 0.001  # Price must move 0.1% in signal direction
+        self.CONFIRMATION_WAIT = 3      # Wait up to 3 candles for confirmation
+        self.CONFIRMATION_MOVE = 0.0005  # Price must move 0.05% in signal direction
 
     async def start(self):
         """Start the orchestrator and all registered agents."""
@@ -264,15 +264,10 @@ class Orchestrator:
     def _regime_gate_blocks(self, symbol: str) -> bool:
         """Hard regime gate: block ALL trading in unfavorable conditions.
         Returns True if trading should be BLOCKED."""
-        regime = self._regime_by_symbol.get(symbol, "unknown")
-        volatility = self._volatility_by_symbol.get(symbol, "normal")
-
-        # Block in unknown regime (not enough data)
-        if regime == "unknown":
-            return True
-
-        # Block in choppy/low-vol ranging markets — signals are noise
-        if regime == "ranging" and volatility == "low":
+        # Only block when we have very little data — let regime weighting
+        # handle the rest instead of hard-blocking
+        prices = self._price_history.get(symbol, [])
+        if len(prices) < 30:
             return True
 
         return False
@@ -302,15 +297,19 @@ class Orchestrator:
             regime_weight = self._get_agent_regime_weight(agent.name, regime)
             sig["confidence"] *= regime_weight
 
-            # Volatility adjustment — reduce confidence in high-vol, signals are noisier
+            # Volatility adjustment — moderate penalty in high-vol
             if volatility == "high":
-                sig["confidence"] *= 0.7
-                sig["strength"] *= 0.8
+                sig["confidence"] *= 0.85
+                sig["strength"] *= 0.9
             elif volatility == "low":
                 sig["confidence"] *= 1.1  # Low vol = cleaner signals
 
             # Use agent's adaptive self-learned confidence
             sig["confidence"] *= agent.confidence
+
+            # Floor: don't let compounding multipliers crush confidence below 0.15
+            # But punished agents SHOULD have very low confidence — that's the point
+            sig["confidence"] = max(sig["confidence"], 0.15)
 
             filtered.append(sig)
         return filtered
@@ -360,7 +359,7 @@ class Orchestrator:
         signals = self._filter_by_regime(symbol, signals)
         aggregated = self._aggregate_signals(symbol, signals)
 
-        if not aggregated or abs(aggregated.strength) <= 0.50 or len(aggregated.contributing_agents) < 2:
+        if not aggregated or abs(aggregated.strength) <= 0.50 or len(aggregated.contributing_agents) < 3:
             return
 
         # ── ENTRY CONFIRMATION: buffer signal, wait for price to confirm ──
@@ -476,7 +475,7 @@ class Orchestrator:
         else:
             agreement_multiplier = 0.7
 
-        final_confidence = min(total_weight / len(signals) * agreement_multiplier, 1.5)
+        final_confidence = min(max(total_weight / len(signals) * agreement_multiplier, 0.2), 1.5)
         final_strength = abs(net_strength) * agreement_multiplier
 
         # Record this decision for future meta-learning evaluation

@@ -86,8 +86,8 @@ class BacktestEngine:
     FEE_RATE = 0.00075  # 0.075%
     # ATR-based stop-loss/take-profit multipliers
     # Tighter TP than SL → higher win rate; trailing stop lets winners run
-    ATR_SL_MULT = 1.8   # Stop-loss at 1.8x ATR
-    ATR_TP_MULT = 1.5   # Take-profit at 1.5x ATR (close to 1:1 for high win rate)
+    ATR_SL_MULT = 1.5   # Stop-loss at 1.5x ATR (tight stops)
+    ATR_TP_MULT = 3.0   # Take-profit at 3.0x ATR (2:1 reward-to-risk)
     ATR_PERIOD = 14
     # Trailing stop: once trade is in profit by 0.3x ATR, trail at 0.6x ATR behind peak
     TRAIL_ACTIVATION_ATR = 0.3  # Activate trailing stop early to lock in small profits
@@ -249,12 +249,24 @@ class BacktestEngine:
 
         # Compute ATR-based stop-loss and take-profit levels
         current_atr = self._current_atr()
-        if direction == "long":
-            stop_loss = entry_price - current_atr * self.ATR_SL_MULT
-            take_profit = entry_price + current_atr * self.ATR_TP_MULT
+
+        # Leverage-aware stop: ensure SL is always tighter than liquidation distance
+        # Liquidation at ~95% loss → max adverse move = 0.95 / leverage
+        # Use 60% of liquidation distance as hard cap to leave safety margin
+        if self.leverage > 1:
+            max_sl_distance = entry_price * (0.95 / self.leverage) * 0.6
+            sl_distance = min(current_atr * self.ATR_SL_MULT, max_sl_distance)
+            tp_distance = min(current_atr * self.ATR_TP_MULT, max_sl_distance * 2.5)
         else:
-            stop_loss = entry_price + current_atr * self.ATR_SL_MULT
-            take_profit = entry_price - current_atr * self.ATR_TP_MULT
+            sl_distance = current_atr * self.ATR_SL_MULT
+            tp_distance = current_atr * self.ATR_TP_MULT
+
+        if direction == "long":
+            stop_loss = entry_price - sl_distance
+            take_profit = entry_price + tp_distance
+        else:
+            stop_loss = entry_price + sl_distance
+            take_profit = entry_price - tp_distance
 
         self._open_positions[symbol] = {
             "direction": direction,

@@ -70,7 +70,9 @@ from .agents.execution.position_manager import PositionManagerAgent
 from .exchange.bybit_client import BybitClient
 
 # Simulation
-from .agents.simulation.backtester import BacktestEngine, MonteCarloSimulator
+from .agents.simulation.backtester import (
+    BacktestEngine, BacktestResult, MonteCarloSimulator, combine_backtest_results,
+)
 from .agents.simulation.data_fetcher import HistoricalDataFetcher, generate_synthetic_data
 from .agents.simulation.optimizer import (
     AgentPerformanceAnalyzer, ParameterOptimizer, WalkForwardOptimizer,
@@ -253,6 +255,62 @@ def create_agents(message_bus: MessageBus, registry: AgentRegistry, symbols: lis
     return agent_count
 
 
+async def run_portfolio_backtest(
+    historical_data: dict[str, list[dict]],
+    leverage: float = 1.0,
+    initial_balance: float = 10000.0,
+) -> BacktestResult:
+    """
+    Run a portfolio backtest by replaying each symbol independently and combining results.
+
+    The current BacktestEngine is single-symbol, so we split capital evenly across
+    the requested symbols and merge the resulting equity curves, trades, and signals.
+    """
+    active_symbols = [symbol for symbol, candles in historical_data.items() if candles]
+    if not active_symbols:
+        raise ValueError("No historical data available for portfolio backtest")
+
+    per_symbol_balance = initial_balance / len(active_symbols)
+    symbol_results = []
+
+    for symbol in active_symbols:
+        logger.info(
+            f"Running portfolio backtest leg for {symbol} with ${per_symbol_balance:.2f} initial balance"
+        )
+        message_bus = MessageBus()
+        registry = AgentRegistry()
+        create_agents(message_bus, registry, [symbol])
+
+        pos_sizer = registry.get_by_name("position_sizer")
+        if pos_sizer:
+            pos_sizer.leverage = leverage
+            pos_sizer.account_balance = per_symbol_balance
+
+        executor = OrderExecutorAgent(
+            message_bus,
+            config={"stop_loss_pct": 0.02, "take_profit_pct": 0.04},
+        )
+        registry.register(executor, "execution")
+
+        orchestrator = Orchestrator(message_bus, registry)
+        engine = BacktestEngine(
+            message_bus,
+            initial_balance=per_symbol_balance,
+            orchestrator=orchestrator,
+            leverage=leverage,
+        )
+
+        await orchestrator.start()
+        try:
+            symbol_result = await engine.run(historical_data[symbol], symbol)
+        finally:
+            await orchestrator.stop()
+
+        symbol_results.append(symbol_result)
+
+    return combine_backtest_results(symbol_results, initial_balance=initial_balance)
+
+
 async def run_live(symbols: list[str], testnet: bool = True, leverage: int = 25):
     """Run the system in live/paper trading mode with Bybit."""
     message_bus = MessageBus()
@@ -371,21 +429,7 @@ async def run_backtest(symbols: list[str]):
         logger.error("No historical data available. Place JSON files in backtest_data/")
         return
 
-    message_bus = MessageBus()
-    registry = AgentRegistry()
-    create_agents(message_bus, registry, list(historical_data.keys()))
-
-    executor = OrderExecutorAgent(message_bus, config={"stop_loss_pct": 0.02, "take_profit_pct": 0.04})
-    registry.register(executor, "execution")
-
-    orchestrator = Orchestrator(message_bus, registry)
-
-    # Run backtest on each symbol with real data
-    primary_symbol = list(historical_data.keys())[0]
-    engine = BacktestEngine(message_bus, initial_balance=10000.0, orchestrator=orchestrator)
-    await orchestrator.start()
-    result = await engine.run(historical_data[primary_symbol], primary_symbol)
-    await orchestrator.stop()
+    result = await run_portfolio_backtest(historical_data, leverage=1.0, initial_balance=10000.0)
 
     # Print results
     print("\n" + "=" * 60)
@@ -457,26 +501,11 @@ async def run_optimize(symbols: list[str], use_real_data: bool = False,
     # ── Step 2: Run backtest with signal tracking ──
     lev_str = f" (leverage: {leverage:.0f}x)" if leverage > 1 else ""
     print(f"\n  Running backtest with agent signal tracking{lev_str}...")
-    message_bus = MessageBus()
-    registry = AgentRegistry()
-
-    create_agents(message_bus, registry, backtest_symbols)
-
-    # Set leverage in position sizer for leverage-aware position sizing
-    pos_sizer = registry.get_by_name("position_sizer")
-    if pos_sizer and hasattr(pos_sizer, 'leverage'):
-        pos_sizer.leverage = leverage
-
-    executor = OrderExecutorAgent(message_bus, config={"stop_loss_pct": 0.02, "take_profit_pct": 0.04})
-    registry.register(executor, "execution")
-
-    orchestrator = Orchestrator(message_bus, registry)
-    engine = BacktestEngine(message_bus, initial_balance=10000.0, orchestrator=orchestrator, leverage=leverage)
-
-    await orchestrator.start()
-    primary_symbol = backtest_symbols[0]
-    result = await engine.run(historical_data[primary_symbol], primary_symbol)
-    await orchestrator.stop()
+    result = await run_portfolio_backtest(
+        historical_data,
+        leverage=leverage,
+        initial_balance=10000.0,
+    )
 
     # ── Step 3: Analyze agent performance ──
     print(f"\n  Analyzing {len(result.agent_signals)} agent signals...")
@@ -484,7 +513,7 @@ async def run_optimize(symbols: list[str], use_real_data: bool = False,
     agent_perfs, strategy_perfs = analyzer.analyze(result.agent_signals)
 
     # ── Step 4: Compute optimized weights ──
-    weights = compute_optimized_weights(agent_perfs, registry)
+    weights = compute_optimized_weights(agent_perfs)
 
     # ── Step 5: Optional parameter grid search ──
     grid_results = []

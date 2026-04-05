@@ -361,7 +361,7 @@ class ParameterOptimizer:
 
 def compute_optimized_weights(
     agent_perfs: list[AgentPerformance],
-    registry: AgentRegistry,
+    registry: AgentRegistry | None = None,
 ) -> dict[str, float]:
     """
     Compute optimized confidence weights for each agent based on backtest performance.

@@ -505,7 +505,7 @@ class BacktestEngine:
 class MonteCarloSimulator:
     """
     Monte Carlo simulation for strategy robustness.
-    Shuffles trade sequence to test if results are robust or luck-dependent.
+    Bootstraps trade outcomes to test if results are robust or luck-dependent.
     """
 
     def __init__(self, trades: list[BacktestTrade], initial_balance: float = 10000.0):
@@ -513,22 +513,31 @@ class MonteCarloSimulator:
         self.initial_balance = initial_balance
 
     def run(self, num_simulations: int = 1000) -> dict:
-        """Run Monte Carlo simulation by shuffling trade order."""
+        """Run Monte Carlo simulation by resampling trades with replacement."""
+        if not self.trades:
+            return {
+                "num_simulations": num_simulations,
+                "return_mean": 0.0,
+                "return_median": 0.0,
+                "return_5th_pct": 0.0,
+                "return_95th_pct": 0.0,
+                "max_dd_mean": 0.0,
+                "max_dd_worst": 0.0,
+                "probability_profitable": 0.0,
+            }
+
         results = []
         pnls = [t.pnl for t in self.trades]
 
         for _ in range(num_simulations):
-            shuffled = pnls.copy()
-            random.shuffle(shuffled)
+            sampled = random.choices(pnls, k=len(pnls))
 
             balance = self.initial_balance
             peak = balance
             max_dd = 0.0
-            curve = [balance]
 
-            for pnl in shuffled:
+            for pnl in sampled:
                 balance += pnl
-                curve.append(balance)
                 if balance > peak:
                     peak = balance
                 dd = (peak - balance) / peak if peak > 0 else 0.0
@@ -555,3 +564,70 @@ class MonteCarloSimulator:
             "max_dd_worst": round(max(drawdowns), 2),
             "probability_profitable": round(sum(1 for r in returns if r > 0) / len(returns) * 100, 1),
         }
+
+
+def combine_backtest_results(results: list[BacktestResult], initial_balance: float) -> BacktestResult:
+    """Combine multiple single-symbol backtests into one portfolio-level result."""
+    if not results:
+        return BacktestResult(
+            total_return_pct=0.0,
+            sharpe_ratio=0.0,
+            sortino_ratio=0.0,
+            max_drawdown_pct=0.0,
+            total_trades=0,
+            win_rate=0.0,
+            profit_factor=0.0,
+            avg_trade_pnl=0.0,
+            best_trade=0.0,
+            worst_trade=0.0,
+            final_balance=initial_balance,
+        )
+
+    max_curve_len = max((len(r.equity_curve) for r in results), default=0)
+    combined_curve: list[float] = []
+    for idx in range(max_curve_len):
+        total_equity = 0.0
+        for result in results:
+            if not result.equity_curve:
+                continue
+            curve_idx = min(idx, len(result.equity_curve) - 1)
+            total_equity += result.equity_curve[curve_idx]
+        combined_curve.append(total_equity)
+
+    combined_returns = []
+    for idx in range(1, len(combined_curve)):
+        prev_equity = combined_curve[idx - 1]
+        current_equity = combined_curve[idx]
+        if prev_equity > 0:
+            combined_returns.append((current_equity - prev_equity) / prev_equity)
+
+    trades = [trade for result in results for trade in result.trades]
+    agent_signals = [signal for result in results for signal in result.agent_signals]
+
+    pnls = [trade.pnl for trade in trades]
+    wins = [pnl for pnl in pnls if pnl > 0]
+    losses = [abs(pnl) for pnl in pnls if pnl < 0]
+
+    final_balance = round(sum(result.final_balance for result in results), 2)
+    leverage = results[0].leverage if results else 1.0
+    liquidations = sum(result.liquidations for result in results)
+    total_return = ((final_balance - initial_balance) / initial_balance * 100) if initial_balance > 0 else 0.0
+
+    return BacktestResult(
+        total_return_pct=round(total_return, 2),
+        sharpe_ratio=round(sharpe_ratio(combined_returns), 2) if combined_returns else 0.0,
+        sortino_ratio=round(sortino_ratio(combined_returns), 2) if combined_returns else 0.0,
+        max_drawdown_pct=round(max_drawdown(combined_curve) * 100, 2) if combined_curve else 0.0,
+        total_trades=len(trades),
+        win_rate=round(len(wins) / len(pnls) * 100, 1) if pnls else 0.0,
+        profit_factor=round(sum(wins) / sum(losses), 2) if losses and sum(losses) > 0 else 0.0,
+        avg_trade_pnl=round(sum(pnls) / len(pnls), 2) if pnls else 0.0,
+        best_trade=round(max(pnls), 2) if pnls else 0.0,
+        worst_trade=round(min(pnls), 2) if pnls else 0.0,
+        leverage=leverage,
+        liquidations=liquidations,
+        final_balance=final_balance,
+        equity_curve=combined_curve,
+        trades=trades,
+        agent_signals=agent_signals,
+    )
